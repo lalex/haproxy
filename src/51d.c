@@ -345,6 +345,17 @@ static void _51d_process_match(const struct arg *args, struct sample *smp)
 			chunk_appendf(temp, "%d", fiftyoneDegreesGetSignatureRank(ws));
 			found = 1;
 		}
+		else if (strcmp("DeviceId", args[i].data.str.area) == 0) {
+			struct buffer *deviceId = alloc_trash_chunk();
+			if (deviceId) {
+				int size = fiftyoneDegreesGetDeviceId(ws, deviceId->area, deviceId->size);
+				if (size > 0) {
+					chunk_appendf(temp, "%s", deviceId->area);
+					found = 1;
+				}
+			}
+			free_trash_chunk(deviceId);
+		}
 		else {
 			for (j = 0; j < ws->dataSet->requiredPropertyCount; j++) {
 				property_name = fiftyoneDegreesGetPropertyName(ws->dataSet, ws->dataSet->requiredProperties[j]);
