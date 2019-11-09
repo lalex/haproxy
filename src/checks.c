@@ -22,6 +22,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -59,10 +60,7 @@
 #include <proto/log.h>
 #include <proto/dns.h>
 #include <proto/proto_udp.h>
-
-#ifdef USE_OPENSSL
 #include <proto/ssl_sock.h>
-#endif /* USE_OPENSSL */
 
 static int httpchk_expect(struct server *s, int done);
 static int tcpcheck_get_step_id(struct check *);
@@ -251,7 +249,7 @@ static void set_server_check_status(struct check *check, short status, const cha
 		if ((!(check->state & CHK_ST_AGENT) ||
 		    (check->status >= HCHK_STATUS_L57DATA)) &&
 		    (check->health > 0)) {
-			HA_ATOMIC_ADD(&s->counters.failed_checks, 1);
+			_HA_ATOMIC_ADD(&s->counters.failed_checks, 1);
 			report = 1;
 			check->health--;
 			if (check->health < check->rise)
@@ -419,7 +417,7 @@ void __health_adjust(struct server *s, short status)
 		return;
 	}
 
-	HA_ATOMIC_ADD(&s->consecutive_errors, 1);
+	_HA_ATOMIC_ADD(&s->consecutive_errors, 1);
 
 	if (s->consecutive_errors < s->consecutive_errors_limit)
 		return;
@@ -460,7 +458,7 @@ void __health_adjust(struct server *s, short status)
 	}
 
 	s->consecutive_errors = 0;
-	HA_ATOMIC_ADD(&s->counters.failed_hana, 1);
+	_HA_ATOMIC_ADD(&s->counters.failed_hana, 1);
 
 	if (s->check.fastinter) {
 		expire = tick_add(now_ms, MS_TO_TICKS(s->check.fastinter));
@@ -718,10 +716,11 @@ static struct task *event_srv_chk_io(struct task *t, void *ctx, unsigned short s
 	struct check *check = ctx;
 	struct conn_stream *cs = check->cs;
 	struct email_alertq *q = container_of(check, typeof(*q), check);
+	int ret = 0;
 
 	if (!(check->wait_list.events & SUB_RETRY_SEND))
-		wake_srv_chk(cs);
-	if (!(check->wait_list.events & SUB_RETRY_RECV)) {
+		ret = wake_srv_chk(cs);
+	if (ret == 0 && !(check->wait_list.events & SUB_RETRY_RECV)) {
 		if (check->server)
 			HA_SPIN_LOCK(SERVER_LOCK, &check->server->lock);
 		else
@@ -752,7 +751,8 @@ static void __event_srv_chk_w(struct conn_stream *cs)
 		goto out_wakeup;
 
 	if (conn->flags & CO_FL_HANDSHAKE) {
-		cs->conn->mux->subscribe(cs, SUB_RETRY_SEND, &check->wait_list);
+		if (!(conn->flags & CO_FL_ERROR))
+			cs->conn->mux->subscribe(cs, SUB_RETRY_SEND, &check->wait_list);
 		goto out;
 	}
 
@@ -790,6 +790,9 @@ static void __event_srv_chk_w(struct conn_stream *cs)
 			goto out;
 		}
 	}
+
+	if (!b_data(&check->bo))
+		conn_xprt_stop_send(conn);
 
 	/* full request sent, we allow up to <timeout.check> if nonzero for a response */
 	if (s->proxy->timeout.check) {
@@ -837,7 +840,8 @@ static void __event_srv_chk_r(struct conn_stream *cs)
 		goto out_wakeup;
 
 	if (conn->flags & CO_FL_HANDSHAKE) {
-		cs->conn->mux->subscribe(cs, SUB_RETRY_RECV, &check->wait_list);
+		if (!(conn->flags & CO_FL_ERROR))
+			cs->conn->mux->subscribe(cs, SUB_RETRY_RECV, &check->wait_list);
 		goto out;
 	}
 
@@ -871,6 +875,9 @@ static void __event_srv_chk_r(struct conn_stream *cs)
 		}
 	}
 
+	/* the rest of the code below expects the connection to be ready! */
+	if (!(conn->flags & CO_FL_CONNECTED) && !done)
+		goto wait_more_data;
 
 	/* Intermediate or complete response received.
 	 * Terminate string in b_head(&check->bi) buffer.
@@ -939,6 +946,10 @@ static void __event_srv_chk_r(struct conn_stream *cs)
 	case PR_O2_SMTP_CHK:
 		if (!done && b_data(&check->bi) < strlen("000\r"))
 			goto wait_more_data;
+
+		/* do not reset when closing, servers don't like this */
+		if (conn_ctrl_ready(cs->conn))
+			fdtab[cs->conn->handle.fd].linger_risk = 0;
 
 		/* Check if the server speaks SMTP */
 		if ((b_data(&check->bi) < strlen("000\r")) ||
@@ -1173,6 +1184,10 @@ static void __event_srv_chk_r(struct conn_stream *cs)
 		if (!done && b_data(&check->bi) < 9)
 			goto wait_more_data;
 
+		/* do not reset when closing, servers don't like this */
+		if (conn_ctrl_ready(cs->conn))
+			fdtab[cs->conn->handle.fd].linger_risk = 0;
+
 		if (b_head(&check->bi)[0] == 'R') {
 			set_server_check_status(check, HCHK_STATUS_L7OKD, "PostgreSQL server is ok");
 		}
@@ -1201,6 +1216,10 @@ static void __event_srv_chk_r(struct conn_stream *cs)
 	case PR_O2_MYSQL_CHK:
 		if (!done && b_data(&check->bi) < 5)
 			goto wait_more_data;
+
+		/* do not reset when closing, servers don't like this */
+		if (conn_ctrl_ready(cs->conn))
+			fdtab[cs->conn->handle.fd].linger_risk = 0;
 
 		if (s->proxy->check_len == 0) { // old mode
 			if (*(b_head(&check->bi) + 4) != '\xff') {
@@ -1362,7 +1381,13 @@ static void __event_srv_chk_r(struct conn_stream *cs)
 	}
 
 	default:
-		/* for other checks (eg: pure TCP), delegate to the main task */
+		/* good connection is enough for pure TCP check */
+		if ((conn->flags & CO_FL_CONNECTED) && !check->type) {
+			if (check->use_ssl)
+				set_server_check_status(check, HCHK_STATUS_L6OK, NULL);
+			else
+				set_server_check_status(check, HCHK_STATUS_L4OK, NULL);
+		}
 		break;
 	} /* switch */
 
@@ -1382,6 +1407,11 @@ static void __event_srv_chk_r(struct conn_stream *cs)
 	 * range quickly.  To avoid sending RSTs all the time, we first try to
 	 * drain pending data.
 	 */
+	/* Call cs_shutr() first, to add the CO_FL_SOCK_RD_SH flag on the
+	 * connection, to make sure cs_shutw() will not lead to a shutdown()
+	 * that would provoke TIME_WAITs.
+	 */
+	cs_shutr(cs, CS_SHR_DRAIN);
 	cs_shutw(cs, CS_SHW_NORMAL);
 
 	/* OK, let's not stay here forever */
@@ -1420,8 +1450,12 @@ static int wake_srv_chk(struct conn_stream *cs)
 		ret = tcpcheck_main(check);
 		cs = check->cs;
 		conn = cs->conn;
-	} else if (!(check->wait_list.events & SUB_RETRY_SEND))
-		__event_srv_chk_w(cs);
+	} else {
+		if (!(check->wait_list.events & SUB_RETRY_SEND))
+			__event_srv_chk_w(cs);
+		if (!(check->wait_list.events & SUB_RETRY_RECV))
+			__event_srv_chk_r(cs);
+	}
 
 	if (unlikely(conn->flags & CO_FL_ERROR || cs->flags & CS_FL_ERROR)) {
 		/* We may get error reports bypassing the I/O handlers, typically
@@ -1448,6 +1482,11 @@ static int wake_srv_chk(struct conn_stream *cs)
 		conn_sock_drain(conn);
 		cs_close(cs);
 		ret = -1;
+		/* We may have been scheduled to run, and the
+		 * I/O handler expects to have a cs, so remove
+		 * the tasklet
+		 */
+		tasklet_remove_from_tasklet_list(check->wait_list.tasklet);
 		task_wakeup(check->task, TASK_WOKEN_IO);
 	}
 
@@ -1485,11 +1524,15 @@ static struct task *server_warmup(struct task *t, void *context, unsigned short 
 	    (s->next_state != SRV_ST_STARTING))
 		return t;
 
+	HA_SPIN_LOCK(SERVER_LOCK, &s->lock);
+
 	/* recalculate the weights and update the state */
 	server_recalc_eweight(s, 1);
 
 	/* probably that we can refill this server with a bit more connections */
 	pendconn_grab_from_px(s);
+
+	HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
 
 	/* get back there in 1 second or 1/20th of the slowstart interval,
 	 * whichever is greater, resulting in small 5% steps.
@@ -1538,7 +1581,7 @@ static int connect_conn_chk(struct task *t)
 	struct protocol *proto;
 	struct tcpcheck_rule *tcp_rule = NULL;
 	int ret;
-	int quickack;
+	int connflags = 0;
 
 	/* we cannot have a connection here */
 	if (conn)
@@ -1598,31 +1641,40 @@ static int connect_conn_chk(struct task *t)
 	conn = cs->conn;
 	/* Maybe there were an older connection we were waiting on */
 	check->wait_list.events = 0;
+	tasklet_set_tid(check->wait_list.tasklet, tid);
+
+
+	if (!sockaddr_alloc(&conn->dst))
+		return SF_ERR_RESOURCE;
 
 	if (is_addr(&check->addr)) {
 		/* we'll connect to the check addr specified on the server */
-		conn->addr.to = check->addr;
+		*conn->dst = check->addr;
 	}
 	else {
 		/* we'll connect to the addr on the server */
-		conn->addr.to = s->addr;
+		*conn->dst = s->addr;
 	}
 
-	proto = protocol_by_family(conn->addr.to.ss_family);
+	if (s->check.via_socks4 &&  (s->flags & SRV_F_SOCKS4_PROXY)) {
+		conn->send_proxy_ofs = 1;
+		conn->flags |= CO_FL_SOCKS4;
+	}
+
+	proto = protocol_by_family(conn->dst->ss_family);
 	conn->target = &s->obj_type;
 
-	if ((conn->addr.to.ss_family == AF_INET) || (conn->addr.to.ss_family == AF_INET6)) {
+	if ((conn->dst->ss_family == AF_INET) || (conn->dst->ss_family == AF_INET6)) {
 		int i = 0;
 
 		i = srv_check_healthcheck_port(check);
 		if (i == 0)
 			return SF_ERR_CHK_PORT;
 
-		set_host_port(&conn->addr.to, i);
+		set_host_port(conn->dst, i);
 	}
 
 	/* no client address */
-	clear_addr(&conn->addr.from);
 
 	conn_prepare(conn, proto, check->xprt);
 	if (conn_install_mux(conn, &mux_pt_ops, cs, s->proxy, NULL) < 0)
@@ -1630,14 +1682,15 @@ static int connect_conn_chk(struct task *t)
 	cs_attach(cs, check, &check_conn_cb);
 
 	/* only plain tcp-check supports quick ACK */
-	quickack = check->type == 0 || check->type == PR_O2_TCPCHK_CHK;
-
-	if (tcp_rule && tcp_rule->action == TCPCHK_ACT_EXPECT)
-		quickack = 0;
+	if (check->type != 0)
+		connflags |= CONNECT_HAS_DATA;
+	if ((check->type == 0 || check->type == PR_O2_TCPCHK_CHK) &&
+	    (!tcp_rule || tcp_rule->action != TCPCHK_ACT_EXPECT))
+		connflags |= CONNECT_DELACK_ALWAYS;
 
 	ret = SF_ERR_INTERNAL;
 	if (proto && proto->connect)
-		ret = proto->connect(conn, check->type, quickack ? 2 : 0);
+		ret = proto->connect(conn, connflags);
 
 
 #ifdef USE_OPENSSL
@@ -1652,6 +1705,8 @@ static int connect_conn_chk(struct task *t)
 	if (s->check.send_proxy && !(check->state & CHK_ST_AGENT)) {
 		conn->send_proxy_ofs = 1;
 		conn->flags |= CO_FL_SEND_PROXY;
+		if (xprt_add_hs(conn) < 0)
+			ret = SF_ERR_RESOURCE;
 	}
 
 	return ret;
@@ -1965,16 +2020,27 @@ static int connect_proc_chk(struct task *t)
 	if (pid == 0) {
 		/* Child */
 		extern char **environ;
+		struct rlimit limit;
 		int fd;
 
 		/* close all FDs. Keep stdin/stdout/stderr in verbose mode */
 		fd = (global.mode & (MODE_QUIET|MODE_VERBOSE)) == MODE_QUIET ? 0 : 3;
 
-		while (fd < global.rlimit_nofile)
-			close(fd++);
+		my_closefrom(fd);
+
+		/* restore the initial FD limits */
+		limit.rlim_cur = rlim_fd_cur_at_boot;
+		limit.rlim_max = rlim_fd_max_at_boot;
+		if (setrlimit(RLIMIT_NOFILE, &limit) == -1) {
+			getrlimit(RLIMIT_NOFILE, &limit);
+			ha_warning("External check: failed to restore initial FD limits (cur=%u max=%u), using cur=%u max=%u\n",
+				   rlim_fd_cur_at_boot, rlim_fd_max_at_boot,
+				   (unsigned int)limit.rlim_cur, (unsigned int)limit.rlim_max);
+		}
 
 		environ = check->envp;
 		extchk_setenv(check, EXTCHK_HAPROXY_SERVER_CURCONN, ultoa_r(s->cur_sess, buf, sizeof(buf)));
+		haproxy_unblock_signals();
 		execvp(px->check_command, check->argv);
 		ha_alert("Failed to exec process for external health check: %s. Aborting.\n",
 			 strerror(errno));
@@ -2116,7 +2182,7 @@ static struct task *process_chk_proc(struct task *t, void *context, unsigned sho
 			/* a success was detected */
 			check_notify_success(check);
 		}
-		task_set_affinity(t, MAX_THREADS_MASK);
+		task_set_affinity(t, 1);
 		check->state &= ~CHK_ST_INPROGRESS;
 
 		pid_list_del(check->curpid);
@@ -2197,8 +2263,16 @@ static struct task *process_chk_conn(struct task *t, void *context, unsigned sho
 				t->expire = tick_first(t->expire, t_con);
 			}
 
-			if (check->type)
-				__event_srv_chk_r(cs);
+			if (check->type) {
+				/* send the request if we have one. We avoid receiving
+				 * if not connected, unless we didn't subscribe for
+				 * sending since otherwise we won't be woken up.
+				 */
+				__event_srv_chk_w(cs);
+				if (!(conn->flags & CO_FL_WAIT_L4_CONN) ||
+				    !(check->wait_list.events & SUB_RETRY_SEND))
+					__event_srv_chk_r(cs);
+			}
 
 			task_set_affinity(t, tid_bit);
 			goto reschedule;
@@ -2223,6 +2297,16 @@ static struct task *process_chk_conn(struct task *t, void *context, unsigned sho
 
 		/* here, we have seen a synchronous error, no fd was allocated */
 		if (cs) {
+			if (check->wait_list.events)
+				cs->conn->xprt->unsubscribe(cs->conn,
+				                            cs->conn->xprt_ctx,
+							    check->wait_list.events,
+							    &check->wait_list);
+			/* We may have been scheduled to run, and the
+			 * I/O handler expects to have a cs, so remove
+			 * the tasklet
+			 */
+			tasklet_remove_from_tasklet_list(check->wait_list.tasklet);
 			cs_destroy(cs);
 			cs = check->cs = NULL;
 			conn = NULL;
@@ -2277,6 +2361,16 @@ static struct task *process_chk_conn(struct task *t, void *context, unsigned sho
 		}
 
 		if (cs) {
+			if (check->wait_list.events)
+				cs->conn->xprt->unsubscribe(cs->conn,
+				    cs->conn->xprt_ctx,
+				    check->wait_list.events,
+				    &check->wait_list);
+			/* We may have been scheduled to run, and the
+			 * I/O handler expects to have a cs, so remove
+			 * the tasklet
+			 */
+			tasklet_remove_from_tasklet_list(check->wait_list.tasklet);
 			cs_destroy(cs);
 			cs = check->cs = NULL;
 			conn = NULL;
@@ -2336,8 +2430,13 @@ static int start_check_task(struct check *check, int mininter,
 			    int nbcheck, int srvpos)
 {
 	struct task *t;
+	unsigned long thread_mask = MAX_THREADS_MASK;
+
+	if (check->type == PR_O2_EXT_CHK)
+		thread_mask = 1;
+
 	/* task for the check */
-	if ((t = task_new(MAX_THREADS_MASK)) == NULL) {
+	if ((t = task_new(thread_mask)) == NULL) {
 		ha_alert("Starting [%s:%s] check: out of memory.\n",
 			 check->server->proxy->id, check->server->id);
 		return 0;
@@ -2629,7 +2728,7 @@ static char * tcpcheck_get_step_comment(struct check *check, int stepid)
  * connection, presenting the risk of an fd replacement.
  *
  * Please do NOT place any return statement in this function and only leave
- * via the out_unlock label after setting retcode.
+ * via the out_end_tcpcheck label after setting retcode.
  */
 static int tcpcheck_main(struct check *check)
 {
@@ -2783,8 +2882,21 @@ static int tcpcheck_main(struct check *check)
 				goto out;
 			}
 
-			if (check->cs)
+			if (check->cs) {
+				if (check->wait_list.events)
+					cs->conn->xprt->unsubscribe(cs->conn,
+					                            cs->conn->xprt_ctx,
+								    check->wait_list.events,
+								    &check->wait_list);
+				/* We may have been scheduled to run, and the
+				 * I/O handler expects to have a cs, so remove
+				 * the tasklet
+				 */
+				tasklet_remove_from_tasklet_list(check->wait_list.tasklet);
 				cs_destroy(check->cs);
+			}
+
+			tasklet_set_tid(check->wait_list.tasklet, tid);
 
 			check->cs = cs;
 			conn = cs->conn;
@@ -2793,25 +2905,29 @@ static int tcpcheck_main(struct check *check)
 			conn->target = s ? &s->obj_type : &proxy->obj_type;
 
 			/* no client address */
-			clear_addr(&conn->addr.from);
+
+			if (!sockaddr_alloc(&conn->dst)) {
+				ret = SF_ERR_RESOURCE;
+				goto fail_check;
+			}
 
 			if (is_addr(&check->addr)) {
 				/* we'll connect to the check addr specified on the server */
-				conn->addr.to = check->addr;
+				*conn->dst = check->addr;
 			}
 			else {
 				/* we'll connect to the addr on the server */
-				conn->addr.to = s->addr;
+				*conn->dst = s->addr;
 			}
-			proto = protocol_by_family(conn->addr.to.ss_family);
+			proto = protocol_by_family(conn->dst->ss_family);
 
 			/* port */
 			if (check->current_step->port)
-				set_host_port(&conn->addr.to, check->current_step->port);
+				set_host_port(conn->dst, check->current_step->port);
 			else if (check->port)
-				set_host_port(&conn->addr.to, check->port);
+				set_host_port(conn->dst, check->port);
 			else if (s->svc_port)
-				set_host_port(&conn->addr.to, s->svc_port);
+				set_host_port(conn->dst, s->svc_port);
 
 			if (check->current_step->conn_opts & TCPCHK_OPT_SSL) {
 				xprt = xprt_get(XPRT_SSL);
@@ -2821,18 +2937,23 @@ static int tcpcheck_main(struct check *check)
 			}
 
 			conn_prepare(conn, proto, xprt);
-			if (conn_install_mux(conn, &mux_pt_ops, cs, proxy, NULL) < 0)
-				return SF_ERR_RESOURCE;
+
+			if (conn_install_mux(conn, &mux_pt_ops, cs, proxy, NULL) < 0) {
+				ret = SF_ERR_RESOURCE;
+				goto fail_check;
+			}
+
 			cs_attach(cs, check, &check_conn_cb);
 
 			ret = SF_ERR_INTERNAL;
-			if (proto->connect)
+			if (proto && proto->connect)
 				ret = proto->connect(conn,
-						     1 /* I/O polling is always needed */,
-						     (next && next->action == TCPCHK_ACT_EXPECT) ? 0 : 2);
+						     CONNECT_HAS_DATA /* I/O polling is always needed */ | (next && next->action == TCPCHK_ACT_EXPECT) ? 0 : CONNECT_DELACK_ALWAYS);
 			if (check->current_step->conn_opts & TCPCHK_OPT_SEND_PROXY) {
 				conn->send_proxy_ofs = 1;
 				conn->flags |= CO_FL_SEND_PROXY;
+				if (xprt_add_hs(conn) < 0)
+					ret = SF_ERR_RESOURCE;
 			}
 
 			/* It can return one of :
@@ -2846,6 +2967,7 @@ static int tcpcheck_main(struct check *check)
 			 * Note that we try to prevent the network stack from sending the ACK during the
 			 * connect() when a pure TCP check is used (without PROXY protocol).
 			 */
+		fail_check:
 			switch (ret) {
 			case SF_ERR_NONE:
 				/* we allow up to min(inter, timeout.connect) for a connection
@@ -2894,6 +3016,10 @@ static int tcpcheck_main(struct check *check)
 			if (&check->current_step->list == head)
 				break;
 
+			/* don't do anything until the connection is established */
+			if (!(conn->flags & CO_FL_CONNECTED))
+				break;
+
 		} /* end 'connect' */
 		else if (check->current_step->action == TCPCHK_ACT_SEND) {
 			/* mark the step as started */
@@ -2940,6 +3066,11 @@ static int tcpcheck_main(struct check *check)
 			if (unlikely(check->result == CHK_RES_FAILED))
 				goto out_end_tcpcheck;
 
+			/* If we already subscribed, then we tried to received
+			 * and failed, so there's no point trying again.
+			 */
+			if (check->wait_list.events & SUB_RETRY_RECV)
+				break;
 			if (cs->conn->mux->rcv_buf(cs, &check->bi, b_size(&check->bi), 0) <= 0) {
 				if (conn->flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH) || cs->flags & CS_FL_ERROR) {
 					done = 1;
@@ -3118,7 +3249,7 @@ static int tcpcheck_main(struct check *check)
 
  out_end_tcpcheck:
 	/* collect possible new errors */
-	if (conn->flags & CO_FL_ERROR || cs->flags & CS_FL_ERROR)
+	if ((conn && conn->flags & CO_FL_ERROR) || (cs && cs->flags & CS_FL_ERROR))
 		chk_report_conn_err(check, 0, 0);
 
 	/* cleanup before leaving */
@@ -3144,12 +3275,12 @@ const char *init_check(struct check *check, int type)
 	if (!check->bi.area || !check->bo.area)
 		return "out of memory while allocating check buffer";
 
-	check->wait_list.task = tasklet_new();
-	if (!check->wait_list.task)
+	check->wait_list.tasklet = tasklet_new();
+	if (!check->wait_list.tasklet)
 		return "out of memroy while allocating check tasklet";
 	check->wait_list.events = 0;
-	check->wait_list.task->process = event_srv_chk_io;
-	check->wait_list.task->context = check;
+	check->wait_list.tasklet->process = event_srv_chk_io;
+	check->wait_list.tasklet->context = check;
 	return NULL;
 }
 
@@ -3176,8 +3307,7 @@ void email_alert_free(struct email_alert *alert)
 		LIST_DEL(&rule->list);
 		free(rule->comment);
 		free(rule->string);
-		if (rule->expect_regex)
-			regex_free(rule->expect_regex);
+		regex_free(rule->expect_regex);
 		pool_free(pool_head_tcpcheck_rule, rule);
 	}
 	pool_free(pool_head_email_alert, alert);
@@ -3287,11 +3417,7 @@ int init_email_alert(struct mailers *mls, struct proxy *p, char **err)
 		struct email_alertq *q     = &queues[i];
 		struct check        *check = &q->check;
 
-		if (check->task) {
-			task_delete(check->task);
-			task_free(check->task);
-			check->task = NULL;
-		}
+		task_destroy(check->task);
 		free_check(check);
 	}
 	free(queues);

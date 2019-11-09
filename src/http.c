@@ -155,11 +155,6 @@ const unsigned char http_char_classes[256] = {
 	[127] = HTTP_FLG_CTL,
 };
 
-/* We must put the messages here since GCC cannot initialize consts depending
- * on strlen().
- */
-struct buffer http_err_chunks[HTTP_ERR_SIZE];
-
 const struct ist HTTP_100 = IST("HTTP/1.1 100 Continue\r\n\r\n");
 
 const struct ist HTTP_103 = IST("HTTP/1.1 103 Early Hints\r\n");
@@ -198,7 +193,8 @@ const char *HTTP_308 =
 
 /* Warning: this one is an sprintf() fmt string, with <realm> as its only argument */
 const char *HTTP_401_fmt =
-	"HTTP/1.0 401 Unauthorized\r\n"
+	"HTTP/1.1 401 Unauthorized\r\n"
+	"Content-length: 112\r\n"
 	"Cache-Control: no-cache\r\n"
 	"Connection: close\r\n"
 	"Content-Type: text/html\r\n"
@@ -207,7 +203,8 @@ const char *HTTP_401_fmt =
 	"<html><body><h1>401 Unauthorized</h1>\nYou need a valid user and password to access this content.\n</body></html>\n";
 
 const char *HTTP_407_fmt =
-	"HTTP/1.0 407 Unauthorized\r\n"
+	"HTTP/1.1 407 Unauthorized\r\n"
+	"Content-length: 112\r\n"
 	"Cache-Control: no-cache\r\n"
 	"Connection: close\r\n"
 	"Content-Type: text/html\r\n"
@@ -232,7 +229,8 @@ const int http_err_codes[HTTP_ERR_SIZE] = {
 
 const char *http_err_msgs[HTTP_ERR_SIZE] = {
 	[HTTP_ERR_200] =
-	"HTTP/1.0 200 OK\r\n"
+	"HTTP/1.1 200 OK\r\n"
+	"Content-length: 58\r\n"
 	"Cache-Control: no-cache\r\n"
 	"Connection: close\r\n"
 	"Content-Type: text/html\r\n"
@@ -240,7 +238,8 @@ const char *http_err_msgs[HTTP_ERR_SIZE] = {
 	"<html><body><h1>200 OK</h1>\nService ready.\n</body></html>\n",
 
 	[HTTP_ERR_400] =
-	"HTTP/1.0 400 Bad request\r\n"
+	"HTTP/1.1 400 Bad request\r\n"
+	"Content-length: 90\r\n"
 	"Cache-Control: no-cache\r\n"
 	"Connection: close\r\n"
 	"Content-Type: text/html\r\n"
@@ -248,7 +247,8 @@ const char *http_err_msgs[HTTP_ERR_SIZE] = {
 	"<html><body><h1>400 Bad request</h1>\nYour browser sent an invalid request.\n</body></html>\n",
 
 	[HTTP_ERR_403] =
-	"HTTP/1.0 403 Forbidden\r\n"
+	"HTTP/1.1 403 Forbidden\r\n"
+	"Content-length: 93\r\n"
 	"Cache-Control: no-cache\r\n"
 	"Connection: close\r\n"
 	"Content-Type: text/html\r\n"
@@ -256,7 +256,8 @@ const char *http_err_msgs[HTTP_ERR_SIZE] = {
 	"<html><body><h1>403 Forbidden</h1>\nRequest forbidden by administrative rules.\n</body></html>\n",
 
 	[HTTP_ERR_405] =
-	"HTTP/1.0 405 Method Not Allowed\r\n"
+	"HTTP/1.1 405 Method Not Allowed\r\n"
+	"Content-length: 146\r\n"
 	"Cache-Control: no-cache\r\n"
 	"Connection: close\r\n"
 	"Content-Type: text/html\r\n"
@@ -264,7 +265,8 @@ const char *http_err_msgs[HTTP_ERR_SIZE] = {
 	"<html><body><h1>405 Method Not Allowed</h1>\nA request was made of a resource using a request method not supported by that resource\n</body></html>\n",
 
 	[HTTP_ERR_408] =
-	"HTTP/1.0 408 Request Time-out\r\n"
+	"HTTP/1.1 408 Request Time-out\r\n"
+	"Content-length: 110\r\n"
 	"Cache-Control: no-cache\r\n"
 	"Connection: close\r\n"
 	"Content-Type: text/html\r\n"
@@ -272,7 +274,8 @@ const char *http_err_msgs[HTTP_ERR_SIZE] = {
 	"<html><body><h1>408 Request Time-out</h1>\nYour browser didn't send a complete request in time.\n</body></html>\n",
 
 	[HTTP_ERR_421] =
-	"HTTP/1.0 421 Misdirected Request\r\n"
+	"HTTP/1.1 421 Misdirected Request\r\n"
+	"Content-length: 104\r\n"
 	"Cache-Control: no-cache\r\n"
 	"Connection: close\r\n"
 	"Content-Type: text/html\r\n"
@@ -280,7 +283,8 @@ const char *http_err_msgs[HTTP_ERR_SIZE] = {
 	"<html><body><h1>421 Misdirected Request</h1>\nRequest sent to a non-authoritative server.\n</body></html>\n",
 
 	[HTTP_ERR_425] =
-	"HTTP/1.0 425 Too Early\r\n"
+	"HTTP/1.1 425 Too Early\r\n"
+	"Content-length: 80\r\n"
 	"Cache-Control: no-cache\r\n"
 	"Connection: close\r\n"
 	"Content-Type: text/html\r\n"
@@ -288,7 +292,8 @@ const char *http_err_msgs[HTTP_ERR_SIZE] = {
 	"<html><body><h1>425 Too Early</h1>\nYour browser sent early data.\n</body></html>\n",
 
 	[HTTP_ERR_429] =
-	"HTTP/1.0 429 Too Many Requests\r\n"
+	"HTTP/1.1 429 Too Many Requests\r\n"
+	"Content-length: 117\r\n"
 	"Cache-Control: no-cache\r\n"
 	"Connection: close\r\n"
 	"Content-Type: text/html\r\n"
@@ -296,7 +301,8 @@ const char *http_err_msgs[HTTP_ERR_SIZE] = {
 	"<html><body><h1>429 Too Many Requests</h1>\nYou have sent too many requests in a given amount of time.\n</body></html>\n",
 
 	[HTTP_ERR_500] =
-	"HTTP/1.0 500 Internal Server Error\r\n"
+	"HTTP/1.1 500 Internal Server Error\r\n"
+	"Content-length: 96\r\n"
 	"Cache-Control: no-cache\r\n"
 	"Connection: close\r\n"
 	"Content-Type: text/html\r\n"
@@ -304,7 +310,8 @@ const char *http_err_msgs[HTTP_ERR_SIZE] = {
 	"<html><body><h1>500 Internal Server Error</h1>\nAn internal server error occured.\n</body></html>\n",
 
 	[HTTP_ERR_502] =
-	"HTTP/1.0 502 Bad Gateway\r\n"
+	"HTTP/1.1 502 Bad Gateway\r\n"
+	"Content-length: 107\r\n"
 	"Cache-Control: no-cache\r\n"
 	"Connection: close\r\n"
 	"Content-Type: text/html\r\n"
@@ -312,7 +319,8 @@ const char *http_err_msgs[HTTP_ERR_SIZE] = {
 	"<html><body><h1>502 Bad Gateway</h1>\nThe server returned an invalid or incomplete response.\n</body></html>\n",
 
 	[HTTP_ERR_503] =
-	"HTTP/1.0 503 Service Unavailable\r\n"
+	"HTTP/1.1 503 Service Unavailable\r\n"
+	"Content-length: 107\r\n"
 	"Cache-Control: no-cache\r\n"
 	"Connection: close\r\n"
 	"Content-Type: text/html\r\n"
@@ -320,7 +328,8 @@ const char *http_err_msgs[HTTP_ERR_SIZE] = {
 	"<html><body><h1>503 Service Unavailable</h1>\nNo server is available to handle this request.\n</body></html>\n",
 
 	[HTTP_ERR_504] =
-	"HTTP/1.0 504 Gateway Time-out\r\n"
+	"HTTP/1.1 504 Gateway Time-out\r\n"
+	"Content-length: 92\r\n"
 	"Cache-Control: no-cache\r\n"
 	"Connection: close\r\n"
 	"Content-Type: text/html\r\n"
@@ -362,7 +371,7 @@ enum http_meth_t find_http_meth(const char *str, const int len)
 /* This function returns HTTP_ERR_<num> (enum) matching http status code.
  * Returned value should match codes from http_err_codes.
  */
-const int http_get_status_idx(unsigned int status)
+int http_get_status_idx(unsigned int status)
 {
 	switch (status) {
 	case 200: return HTTP_ERR_200;
@@ -465,6 +474,62 @@ const char *http_get_reason(unsigned int status)
 		default:          return "Other";
 		}
 	}
+}
+
+/* Parse the uri and looks for the authority, between the scheme and the
+ * path. if no_userinfo is not zero, the part before the '@' (including it) is
+ * skipped. If not found, an empty ist is returned. Otherwise, the ist pointing
+ * on the authority is returned.
+ */
+struct ist http_get_authority(const struct ist uri, int no_userinfo)
+{
+	const char *ptr, *start, *end;
+
+	if (!uri.len)
+		goto not_found;
+
+	ptr = uri.ptr;
+	start = ptr;
+	end = ptr + uri.len;
+
+	/* RFC7230, par. 2.7 :
+	 * Request-URI = "*" | absuri | abspath | authority
+	 */
+
+	if (*ptr == '*' || *ptr == '/')
+		goto not_found;
+
+	if (isalpha((unsigned char)*ptr)) {
+		/* this is a scheme as described by RFC3986, par. 3.1, or only
+		 * an authority (in case of a CONNECT method).
+		 */
+		ptr++;
+		while (ptr < end &&
+		       (isalnum((unsigned char)*ptr) || *ptr == '+' || *ptr == '-' || *ptr == '.'))
+			ptr++;
+		/* skip '://' or take the whole as authority if not found */
+		if (ptr == end || *ptr++ != ':')
+			goto authority;
+		if (ptr == end || *ptr++ != '/')
+			goto authority;
+		if (ptr == end || *ptr++ != '/')
+			goto authority;
+	}
+
+	start = ptr;
+	while (ptr < end && *ptr != '/') {
+		if (*ptr++ == '@' && no_userinfo)
+			start = ptr;
+	}
+
+	/* OK, ptr point on the '/' or the end */
+	end = ptr;
+
+  authority:
+	return ist2(start, end - start);
+
+  not_found:
+	return ist2(NULL, 0);
 }
 
 /* Parse the URI from the given transaction (which is assumed to be in request
@@ -972,22 +1037,33 @@ int http_parse_stline(const struct ist line, struct ist *p1, struct ist *p2, str
         return 1;
 }
 
-
-/* post-initializes the HTTP parts. Returns zero on error, with <err>
- * pointing to the error message.
+/* Parses value of a Status header with the following format: "Status: Code[
+ * Reason]".  The parsing is pretty naive and just skip spaces. It return the
+ * numeric value of the status code.
  */
-int init_http(char **err)
+int http_parse_status_val(const struct ist value, struct ist *status, struct ist *reason)
 {
-	int msg;
+	char *p   = value.ptr;
+        char *end = p + value.len;
+	uint16_t code;
 
-	for (msg = 0; msg < HTTP_ERR_SIZE; msg++) {
-		if (!http_err_msgs[msg]) {
-			memprintf(err, "Internal error: no message defined for HTTP return code %d", msg);
-			return 0;
-		}
+	status->len = reason->len = 0;
 
-		http_err_chunks[msg].area = (char *)http_err_msgs[msg];
-		http_err_chunks[msg].data = strlen(http_err_msgs[msg]);
-	}
-	return 1;
+	/* Skip leading spaces */
+        for (; p < end && HTTP_IS_SPHT(*p); p++);
+
+        /* Set the status part */
+        status->ptr = p;
+        for (; p < end && HTTP_IS_TOKEN(*p); p++);
+        status->len = p - status->ptr;
+
+	/* Skip spaces between status and reason */
+        for (; p < end && HTTP_IS_SPHT(*p); p++);
+
+	/* the remaining is the reason */
+        reason->ptr = p;
+        reason->len = end - p;
+
+	code = strl2ui(status->ptr, status->len);
+	return code;
 }

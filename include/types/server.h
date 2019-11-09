@@ -25,14 +25,10 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#ifdef USE_OPENSSL
-#include <openssl/ssl.h>
-#include <types/ssl_sock.h>
-#endif
-
 #include <common/config.h>
 #include <common/mini-clist.h>
 #include <common/hathreads.h>
+#include <common/openssl-compat.h>
 
 #include <eb32tree.h>
 
@@ -43,6 +39,7 @@
 #include <types/obj_type.h>
 #include <types/proxy.h>
 #include <types/queue.h>
+#include <types/ssl_sock.h>
 #include <types/task.h>
 #include <types/checks.h>
 
@@ -143,6 +140,8 @@ enum srv_initaddr {
 #define SRV_F_CHECKPORT    0x0040        /* this server has a check port configured */
 #define SRV_F_AGENTADDR    0x0080        /* this server has a agent addr configured */
 #define SRV_F_COOKIESET    0x0100        /* this server has a cookie configured, so don't generate dynamic cookies */
+#define SRV_F_FASTOPEN     0x0200        /* Use TCP Fast Open to connect to server */
+#define SRV_F_SOCKS4_PROXY 0x0400        /* this server uses SOCKS4 proxy */
 
 /* configured server options for send-proxy (server->pp_opts) */
 #define SRV_PP_V1               0x0001   /* proxy protocol version 1 */
@@ -175,6 +174,9 @@ enum srv_initaddr {
 #define SRV_SSL_O_NO_REUSE     0x200  /* disable session reuse */
 #define SRV_SSL_O_EARLY_DATA   0x400  /* Allow using early data */
 #endif
+
+/* The server names dictionary */
+extern struct dict server_name_dict;
 
 struct pid_list {
 	struct list list;
@@ -221,12 +223,13 @@ struct server {
 	struct list *priv_conns;		/* private idle connections attached to stream interfaces */
 	struct list *idle_conns;		/* sharable idle connections attached or not to a stream interface */
 	struct list *safe_conns;		/* safe idle connections attached to stream interfaces, shared */
-	struct list *idle_orphan_conns;         /* Orphan connections idling */
+	struct mt_list *idle_orphan_conns;         /* Orphan connections idling */
 	unsigned int pool_purge_delay;          /* Delay before starting to purge the idle conns pool */
 	unsigned int max_idle_conns;            /* Max number of connection allowed in the orphan connections list */
 	unsigned int curr_idle_conns;           /* Current number of orphan idling connections */
+	unsigned int *curr_idle_thr;            /* Current number of orphan idling connections per thread */
 	int max_reuse;                          /* Max number of requests on a same connection */
-	struct task **idle_task;                /* task responsible for cleaning idle orphan connections */
+	struct eb32_node idle_node;             /* When to next do cleanup in the idle connections */
 	struct task *warmup;                    /* the task dedicated to the warmup when slowstart is set */
 
 	struct conn_src conn_src;               /* connection source settings */
@@ -294,7 +297,7 @@ struct server {
 			int allocated_size;
 		} * reused_sess;
 		char *ciphers;			/* cipher suite to use if non-null */
-#if (OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined OPENSSL_IS_BORINGSSL && !defined LIBRESSL_VERSION_NUMBER)
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined OPENSSL_IS_BORINGSSL && !defined LIBRESSL_VERSION_NUMBER)
 		char *ciphersuites;			/* TLS 1.3 cipher suite to use if non-null */
 #endif
 		int options;			/* ssl options */
@@ -316,10 +319,11 @@ struct server {
 	} ssl_ctx;
 #endif
 	struct dns_srvrq *srvrq;		/* Pointer representing the DNS SRV requeest, if any */
-	__decl_hathreads(HA_SPINLOCK_T lock);
+	__decl_hathreads(HA_SPINLOCK_T lock);   /* may enclose the proxy's lock, must not be taken under */
 	struct {
 		const char *file;		/* file where the section appears */
 		struct eb32_node id;		/* place in the tree of used IDs */
+		struct ebpt_node name;		/* place in the tree of used names */
 		int line;			/* line where the section appears */
 	} conf;					/* config information */
 	/* Template information used only for server objects which
@@ -337,7 +341,20 @@ struct server {
 		char reason[128];
 	} op_st_chg;				/* operational status change's reason */
 	char adm_st_chg_cause[48];		/* administrative status change's cause */
+
+	struct sockaddr_storage socks4_addr;	/* the address of the SOCKS4 Proxy, including the port */
 };
+
+
+/* Storage structure to load server-state lines from a flat file into
+ * an ebtree, for faster processing
+ */
+struct state_line {
+	char *line;
+	struct ebmb_node name_name;
+	/* WARNING don't put anything after name_name, it's used by the key */
+};
+
 
 /* Descriptor for a "server" keyword. The ->parse() function returns 0 in case of
  * success, or a combination of ERR_* flags if an error is encountered. The

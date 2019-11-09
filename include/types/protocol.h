@@ -73,18 +73,22 @@ struct protocol {
 	int (*unbind_all)(struct protocol *proto);	/* unbind all bound listeners */
 	int (*enable_all)(struct protocol *proto);	/* enable all bound listeners */
 	int (*disable_all)(struct protocol *proto);	/* disable all bound listeners */
-	int (*connect)(struct connection *, int data, int delack);  /* connect function if any */
+	int (*connect)(struct connection *, int flags); /* connect function if any, see below for flags values */
 	int (*get_src)(int fd, struct sockaddr *, socklen_t, int dir); /* syscall used to retrieve src addr */
 	int (*get_dst)(int fd, struct sockaddr *, socklen_t, int dir); /* syscall used to retrieve dst addr */
 	int (*drain)(int fd);                           /* indicates whether we can safely close the fd */
 	int (*pause)(struct listener *l);               /* temporarily pause this listener for a soft restart */
 	void (*add)(struct listener *l, int port);      /* add a listener for this protocol and port */
 
-	struct list listeners;				/* list of listeners using this protocol */
-	int nb_listeners;				/* number of listeners */
-	struct list list;				/* list of registered protocols */
+	struct list listeners;				/* list of listeners using this protocol (under proto_lock) */
+	int nb_listeners;				/* number of listeners (under proto_lock) */
+	struct list list;				/* list of registered protocols (under proto_lock) */
 };
 
+#define CONNECT_HAS_DATA                        0x00000001 /* There's data available to be sent */
+#define CONNECT_DELACK_SMART_CONNECT            0x00000002 /* Use a delayed ACK if the backend has tcp-smart-connect */
+#define CONNECT_DELACK_ALWAYS                   0x00000004 /* Use a delayed ACK */
+#define CONNECT_CAN_USE_TFO                     0x00000008 /* We can use TFO for this connection */
 #endif /* _TYPES_PROTOCOL_H */
 
 /*

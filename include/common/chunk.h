@@ -27,10 +27,11 @@
 
 #include <common/buf.h>
 #include <common/config.h>
+#include <common/ist.h>
 #include <common/memory.h>
 
 
-struct pool_head *pool_head_trash;
+extern struct pool_head *pool_head_trash;
 
 /* function prototypes */
 
@@ -98,7 +99,7 @@ static inline void chunk_initstr(struct buffer *chk, const char *str)
 /* copies chunk <src> into <chk>. Returns 0 in case of failure. */
 static inline int chunk_cpy(struct buffer *chk, const struct buffer *src)
 {
-	if (unlikely(src->data >= chk->size))
+	if (unlikely(src->data > chk->size))
 		return 0;
 
 	chk->data  = src->data;
@@ -109,11 +110,22 @@ static inline int chunk_cpy(struct buffer *chk, const struct buffer *src)
 /* appends chunk <src> after <chk>. Returns 0 in case of failure. */
 static inline int chunk_cat(struct buffer *chk, const struct buffer *src)
 {
-	if (unlikely(chk->data + src->data >= chk->size))
+	if (unlikely(chk->data + src->data > chk->size))
 		return 0;
 
 	memcpy(chk->area + chk->data, src->area, src->data);
 	chk->data += src->data;
+	return 1;
+}
+
+/* appends ist <src> after <chk>. Returns 0 in case of failure. */
+static inline int chunk_istcat(struct buffer *chk, const struct ist src)
+{
+	if (unlikely(chk->data + src.len > chk->size))
+		return 0;
+
+	memcpy(chk->area + chk->data, src.ptr, src.len);
+	chk->data += src.len;
 	return 1;
 }
 
@@ -123,7 +135,7 @@ static inline int chunk_cat(struct buffer *chk, const struct buffer *src)
 static inline int chunk_memcpy(struct buffer *chk, const char *src,
 			       size_t len)
 {
-	if (unlikely(len >= chk->size))
+	if (unlikely(len > chk->size))
 		return 0;
 
 	chk->data  = len;
@@ -138,7 +150,7 @@ static inline int chunk_memcpy(struct buffer *chk, const char *src,
 static inline int chunk_memcat(struct buffer *chk, const char *src,
 			       size_t len)
 {
-	if (unlikely(chk->data + len >= chk->size))
+	if (unlikely(chk->data + len > chk->size))
 		return 0;
 
 	memcpy(chk->area + chk->data, src, len);

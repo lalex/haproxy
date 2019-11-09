@@ -57,7 +57,7 @@
 #define CF_READ_ERROR     0x00000008  /* unrecoverable error on producer side */
 #define CF_READ_ACTIVITY  (CF_READ_NULL|CF_READ_PARTIAL|CF_READ_ERROR)
 
-#define CF_WAKE_CONNECT   0x00000010  /* wake the task up after connect succeeds */
+/* unused: 0x00000010 */
 #define CF_SHUTR          0x00000020  /* producer has already shut down */
 #define CF_SHUTR_NOW      0x00000040  /* the producer must shut down for reads ASAP */
 #define CF_READ_NOEXP     0x00000080  /* producer should not expire */
@@ -117,7 +117,7 @@
 
 #define CF_WAKE_ONCE      0x10000000  /* pretend there is activity on this channel (one-shoot) */
 #define CF_FLT_ANALYZE    0x20000000  /* at least one filter is still analyzing this channel */
-/* unused: 0x40000000 */
+#define CF_EOI            0x40000000  /* end-of-input has been reached */
 #define CF_ISRESP         0x80000000  /* 0 = request channel, 1 = response channel */
 
 /* Masks which define input events for stream analysers */

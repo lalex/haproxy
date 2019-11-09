@@ -26,10 +26,9 @@
 #include <types/stream.h>
 
 #include <proto/filters.h>
-#include <proto/hdr_idx.h>
 #include <proto/http_htx.h>
 #include <proto/log.h>
-#include <proto/proto_http.h>
+#include <proto/http_ana.h>
 #include <proto/stream.h>
 
 const char *trace_flt_id = "trace filter";
@@ -44,12 +43,12 @@ struct trace_config {
 	int           hexdump;
 };
 
-#define TRACE(conf, fmt, ...)						\
+#define FLT_TRACE(conf, fmt, ...)						\
 	fprintf(stderr, "%d.%06d [%-20s] " fmt "\n",			\
 		(int)now.tv_sec, (int)now.tv_usec, (conf)->name,	\
 		##__VA_ARGS__)
 
-#define STRM_TRACE(conf, strm, fmt, ...)						\
+#define FLT_STRM_TRACE(conf, strm, fmt, ...)						\
 	fprintf(stderr, "%d.%06d [%-20s] [strm %p(%x) 0x%08x 0x%08x] " fmt "\n",	\
 		(int)now.tv_sec, (int)now.tv_usec, (conf)->name,			\
 		strm, (strm ? ((struct stream *)strm)->uniq_id : ~0U),			\
@@ -68,9 +67,7 @@ proxy_mode(const struct stream *s)
 {
 	struct proxy *px = (s->flags & SF_BE_ASSIGNED ? s->be : strm_fe(s));
 
-	return ((px->mode == PR_MODE_HTTP)
-		? (IS_HTX_STRM(s) ? "HTX" : "HTTP")
-		: "TCP");
+	return ((px->mode == PR_MODE_HTTP) ? "HTTP" : "TCP");
 }
 
 static const char *
@@ -131,16 +128,17 @@ trace_raw_hexdump(struct buffer *buf, int len, int out)
 static void
 trace_htx_hexdump(struct htx *htx, unsigned int offset, unsigned int len)
 {
-	struct htx_ret htx_ret;
 	struct htx_blk *blk;
 
-	htx_ret = htx_find_blk(htx, offset);
-	blk = htx_ret.blk;
-	offset = htx_ret.ret;
-
-	while (blk) {
+	for (blk = htx_get_first_blk(htx); blk && len; blk = htx_get_next_blk(htx, blk)) {
 		enum htx_blk_type type = htx_get_blk_type(blk);
+		uint32_t sz = htx_get_blksz(blk);
 		struct ist v;
+
+		if (offset >= sz) {
+			offset -= sz;
+			continue;
+		}
 
 		v = htx_get_blk_value(htx, blk);
 		v.ptr += offset;
@@ -150,9 +148,8 @@ trace_htx_hexdump(struct htx *htx, unsigned int offset, unsigned int len)
 		if (v.len > len)
 			v.len = len;
 		len -= v.len;
-		if (type == HTX_BLK_DATA || type == HTX_BLK_TLR)
+		if (type == HTX_BLK_DATA)
 			trace_hexdump(v);
-		blk = htx_get_next_blk(htx, blk);
 	}
 }
 
@@ -173,7 +170,7 @@ trace_init(struct proxy *px, struct flt_conf *fconf)
 	fconf->flags |= FLT_CFG_FL_HTX;
 	fconf->conf = conf;
 
-	TRACE(conf, "filter initialized [read random=%s - fwd random=%s - hexdump=%s]",
+	FLT_TRACE(conf, "filter initialized [read random=%s - fwd random=%s - hexdump=%s]",
 	      (conf->rand_parsing ? "true" : "false"),
 	      (conf->rand_forwarding ? "true" : "false"),
 	      (conf->hexdump ? "true" : "false"));
@@ -187,7 +184,7 @@ trace_deinit(struct proxy *px, struct flt_conf *fconf)
 	struct trace_config *conf = fconf->conf;
 
 	if (conf) {
-		TRACE(conf, "filter deinitialized");
+		FLT_TRACE(conf, "filter deinitialized");
 		free(conf->name);
 		free(conf);
 	}
@@ -208,7 +205,7 @@ trace_init_per_thread(struct proxy *px, struct flt_conf *fconf)
 {
 	struct trace_config *conf = fconf->conf;
 
-	TRACE(conf, "filter initialized for thread tid %u", tid);
+	FLT_TRACE(conf, "filter initialized for thread tid %u", tid);
 	return 0;
 }
 
@@ -219,7 +216,7 @@ trace_deinit_per_thread(struct proxy *px, struct flt_conf *fconf)
 	struct trace_config *conf = fconf->conf;
 
 	if (conf)
-		TRACE(conf, "filter deinitialized for thread tid %u", tid);
+		FLT_TRACE(conf, "filter deinitialized for thread tid %u", tid);
 }
 
 /**************************************************************************
@@ -231,7 +228,7 @@ trace_attach(struct stream *s, struct filter *filter)
 {
 	struct trace_config *conf = FLT_CONF(filter);
 
-	STRM_TRACE(conf, s, "%-25s: filter-type=%s",
+	FLT_STRM_TRACE(conf, s, "%-25s: filter-type=%s",
 		   __FUNCTION__, filter_type(filter));
 
 	return 1;
@@ -244,7 +241,7 @@ trace_detach(struct stream *s, struct filter *filter)
 {
 	struct trace_config *conf = FLT_CONF(filter);
 
-	STRM_TRACE(conf, s, "%-25s: filter-type=%s",
+	FLT_STRM_TRACE(conf, s, "%-25s: filter-type=%s",
 		   __FUNCTION__, filter_type(filter));
 }
 
@@ -254,7 +251,7 @@ trace_stream_start(struct stream *s, struct filter *filter)
 {
 	struct trace_config *conf = FLT_CONF(filter);
 
-	STRM_TRACE(conf, s, "%-25s",
+	FLT_STRM_TRACE(conf, s, "%-25s",
 		   __FUNCTION__);
 	return 0;
 }
@@ -267,7 +264,7 @@ trace_stream_set_backend(struct stream *s, struct filter *filter,
 {
 	struct trace_config *conf = FLT_CONF(filter);
 
-	STRM_TRACE(conf, s, "%-25s: backend=%s",
+	FLT_STRM_TRACE(conf, s, "%-25s: backend=%s",
 		   __FUNCTION__, be->id);
 	return 0;
 }
@@ -278,7 +275,7 @@ trace_stream_stop(struct stream *s, struct filter *filter)
 {
 	struct trace_config *conf = FLT_CONF(filter);
 
-	STRM_TRACE(conf, s, "%-25s",
+	FLT_STRM_TRACE(conf, s, "%-25s",
 		   __FUNCTION__);
 }
 
@@ -288,7 +285,7 @@ trace_check_timeouts(struct stream *s, struct filter *filter)
 {
 	struct trace_config *conf = FLT_CONF(filter);
 
-	STRM_TRACE(conf, s, "%-25s",
+	FLT_STRM_TRACE(conf, s, "%-25s",
 		   __FUNCTION__);
 }
 
@@ -302,7 +299,7 @@ trace_chn_start_analyze(struct stream *s, struct filter *filter,
 {
 	struct trace_config *conf = FLT_CONF(filter);
 
-	STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s)",
+	FLT_STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s)",
 		   __FUNCTION__,
 		   channel_label(chn), proxy_mode(s), stream_pos(s));
 	filter->pre_analyzers  |= (AN_REQ_ALL | AN_RES_ALL);
@@ -378,7 +375,7 @@ trace_chn_analyze(struct stream *s, struct filter *filter,
 			ana = "unknown";
 	}
 
-	STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s) - "
+	FLT_STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s) - "
 		   "analyzer=%s - step=%s",
 		   __FUNCTION__,
 		   channel_label(chn), proxy_mode(s), stream_pos(s),
@@ -393,7 +390,7 @@ trace_chn_end_analyze(struct stream *s, struct filter *filter,
 {
 	struct trace_config *conf = FLT_CONF(filter);
 
-	STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s)",
+	FLT_STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s)",
 		   __FUNCTION__,
 		   channel_label(chn), proxy_mode(s), stream_pos(s));
 	return 1;
@@ -407,52 +404,31 @@ trace_http_headers(struct stream *s, struct filter *filter,
 		   struct http_msg *msg)
 {
 	struct trace_config *conf = FLT_CONF(filter);
+	struct htx *htx = htxbuf(&msg->chn->buf);
+	struct htx_sl *sl = http_get_stline(htx);
+	int32_t pos;
 
-	STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s)",
+	FLT_STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s)\t%.*s %.*s %.*s",
 		   __FUNCTION__,
-		   channel_label(msg->chn), proxy_mode(s), stream_pos(s));
+		   channel_label(msg->chn), proxy_mode(s), stream_pos(s),
+		   HTX_SL_P1_LEN(sl), HTX_SL_P1_PTR(sl),
+		   HTX_SL_P2_LEN(sl), HTX_SL_P2_PTR(sl),
+		   HTX_SL_P3_LEN(sl), HTX_SL_P3_PTR(sl));
 
-	if (IS_HTX_STRM(s)) {
-		struct htx *htx = htxbuf(&msg->chn->buf);
-		struct htx_sl *sl = http_find_stline(htx);
-		int32_t pos;
+	for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+		struct htx_blk *blk = htx_get_blk(htx, pos);
+		enum htx_blk_type type = htx_get_blk_type(blk);
+		struct ist n, v;
 
-		STRM_TRACE(conf, s, "\t%.*s %.*s %.*s",
-			   HTX_SL_P1_LEN(sl), HTX_SL_P1_PTR(sl),
-			   HTX_SL_P2_LEN(sl), HTX_SL_P2_PTR(sl),
-			   HTX_SL_P3_LEN(sl), HTX_SL_P3_PTR(sl));
+		if (type == HTX_BLK_EOH)
+			break;
+		if (type != HTX_BLK_HDR)
+			continue;
 
-		for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
-			struct htx_blk *blk = htx_get_blk(htx, pos);
-			enum htx_blk_type type = htx_get_blk_type(blk);
-			struct ist n, v;
-
-			if (type == HTX_BLK_EOH)
-				break;
-			if (type != HTX_BLK_HDR)
-				continue;
-
-			n = htx_get_blk_name(htx, blk);
-			v = htx_get_blk_value(htx, blk);
-			STRM_TRACE(conf, s, "\t%.*s: %.*s",
-				   (int)n.len, n.ptr, (int)v.len, v.ptr);
-		}
-	}
-	else {
-		struct hdr_idx      *hdr_idx;
-		char                *cur_hdr;
-		int                  cur_idx;
-
-		STRM_TRACE(conf, s, "\t%.*s", MIN(msg->sl.rq.l, 74), ci_head(msg->chn));
-		hdr_idx = &s->txn->hdr_idx;
-		cur_idx = hdr_idx_first_idx(hdr_idx);
-		cur_hdr = ci_head(msg->chn) + hdr_idx_first_pos(hdr_idx);
-		while (cur_idx) {
-			STRM_TRACE(conf, s, "\t%.*s",
-				   MIN(hdr_idx->v[cur_idx].len, 74), cur_hdr);
-			cur_hdr += hdr_idx->v[cur_idx].len + hdr_idx->v[cur_idx].cr + 1;
-			cur_idx = hdr_idx->v[cur_idx].next;
-		}
+		n = htx_get_blk_name(htx, blk);
+		v = htx_get_blk_value(htx, blk);
+		FLT_STRM_TRACE(conf, s, "\t%.*s: %.*s",
+			   (int)n.len, n.ptr, (int)v.len, v.ptr);
 	}
 	return 1;
 }
@@ -464,10 +440,36 @@ trace_http_payload(struct stream *s, struct filter *filter, struct http_msg *msg
 	struct trace_config *conf = FLT_CONF(filter);
 	int ret = len;
 
-	if (ret && conf->rand_forwarding)
-		ret = random() % (ret+1);
+	if (ret && conf->rand_forwarding) {
+		struct htx *htx = htxbuf(&msg->chn->buf);
+		struct htx_blk *blk;
+		uint32_t sz, data = 0;
+		unsigned int off = offset;
 
-	STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s) - "
+		for (blk = htx_get_first_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
+			if (htx_get_blk_type(blk) != HTX_BLK_DATA)
+				break;
+
+			sz = htx_get_blksz(blk);
+			if (off >= sz) {
+				off -= sz;
+				continue;
+			}
+			data  += sz - off;
+			off = 0;
+			if (data > len) {
+				data = len;
+				break;
+			}
+		}
+		if (data)  {
+			ret = random() % (ret+1);
+			if (!ret || ret >= data)
+				ret = len;
+		}
+	}
+
+	FLT_STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s) - "
 		   "offset=%u - len=%u - forward=%d",
 		   __FUNCTION__,
 		   channel_label(msg->chn), proxy_mode(s), stream_pos(s),
@@ -482,46 +484,12 @@ trace_http_payload(struct stream *s, struct filter *filter, struct http_msg *msg
 }
 
 static int
-trace_http_data(struct stream *s, struct filter *filter,
-		      struct http_msg *msg)
-{
-	struct trace_config *conf = FLT_CONF(filter);
-	int avail = MIN(msg->chunk_len + msg->next, ci_data(msg->chn)) - FLT_NXT(filter, msg->chn);
-	int ret   = avail;
-
-	if (ret && conf->rand_parsing)
-		ret = random() % (ret+1);
-
-	STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s) - "
-		   "chunk_len=%llu - next=%u - fwd=%u - avail=%d - consume=%d",
-		   __FUNCTION__,
-		   channel_label(msg->chn), proxy_mode(s), stream_pos(s),
-		   msg->chunk_len, FLT_NXT(filter, msg->chn),
-		   FLT_FWD(filter, msg->chn), avail, ret);
-	if (ret != avail)
-		task_wakeup(s->task, TASK_WOKEN_MSG);
-	return ret;
-}
-
-static int
-trace_http_chunk_trailers(struct stream *s, struct filter *filter,
-			  struct http_msg *msg)
-{
-	struct trace_config *conf = FLT_CONF(filter);
-
-	STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s)",
-		   __FUNCTION__,
-		   channel_label(msg->chn), proxy_mode(s), stream_pos(s));
-	return 1;
-}
-
-static int
 trace_http_end(struct stream *s, struct filter *filter,
 	       struct http_msg *msg)
 {
 	struct trace_config *conf = FLT_CONF(filter);
 
-	STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s)",
+	FLT_STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s)",
 		   __FUNCTION__,
 		   channel_label(msg->chn), proxy_mode(s), stream_pos(s));
 	return 1;
@@ -533,7 +501,7 @@ trace_http_reset(struct stream *s, struct filter *filter,
 {
 	struct trace_config *conf = FLT_CONF(filter);
 
-	STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s)",
+	FLT_STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s)",
 		   __FUNCTION__,
 		   channel_label(msg->chn), proxy_mode(s), stream_pos(s));
 }
@@ -544,36 +512,8 @@ trace_http_reply(struct stream *s, struct filter *filter, short status,
 {
 	struct trace_config *conf = FLT_CONF(filter);
 
-	STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s)",
+	FLT_STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s)",
 		   __FUNCTION__, "-", proxy_mode(s), stream_pos(s));
-}
-
-static int
-trace_http_forward_data(struct stream *s, struct filter *filter,
-			struct http_msg *msg, unsigned int len)
-{
-	struct trace_config *conf = FLT_CONF(filter);
-	int                  ret  = len;
-
-	if (ret && conf->rand_forwarding)
-		ret = random() % (ret+1);
-
-	STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s) - "
-		   "len=%u - nxt=%u - fwd=%u - forward=%d",
-		   __FUNCTION__,
-		   channel_label(msg->chn), proxy_mode(s), stream_pos(s), len,
-		   FLT_NXT(filter, msg->chn), FLT_FWD(filter, msg->chn), ret);
-
-	if (conf->hexdump) {
-		c_adv(msg->chn, FLT_FWD(filter, msg->chn));
-		trace_raw_hexdump(&msg->chn->buf, ret, co_data(msg->chn));
-		c_rew(msg->chn, FLT_FWD(filter, msg->chn));
-	}
-
-	if ((ret != len) ||
-	    (FLT_NXT(filter, msg->chn) != FLT_FWD(filter, msg->chn) + ret))
-		task_wakeup(s->task, TASK_WOKEN_MSG);
-	return ret;
 }
 
 /**************************************************************************
@@ -589,7 +529,7 @@ trace_tcp_data(struct stream *s, struct filter *filter, struct channel *chn)
 	if (ret && conf->rand_parsing)
 		ret = random() % (ret+1);
 
-	STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s) - next=%u - avail=%u - consume=%d",
+	FLT_STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s) - next=%u - avail=%u - consume=%d",
 		   __FUNCTION__,
 		   channel_label(chn), proxy_mode(s), stream_pos(s),
 		   FLT_NXT(filter, chn), avail, ret);
@@ -609,7 +549,7 @@ trace_tcp_forward_data(struct stream *s, struct filter *filter, struct channel *
 	if (ret && conf->rand_forwarding)
 		ret = random() % (ret+1);
 
-	STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s) - len=%u - fwd=%u - forward=%d",
+	FLT_STRM_TRACE(conf, s, "%-25s: channel=%-10s - mode=%-5s (%s) - len=%u - fwd=%u - forward=%d",
 		   __FUNCTION__,
 		   channel_label(chn), proxy_mode(s), stream_pos(s), len,
 		   FLT_FWD(filter, chn), ret);
@@ -653,14 +593,9 @@ struct flt_ops trace_ops = {
 	/* Filter HTTP requests and responses */
 	.http_headers        = trace_http_headers,
 	.http_payload        = trace_http_payload,
-
-	.http_data           = trace_http_data,
-	.http_chunk_trailers = trace_http_chunk_trailers,
 	.http_end            = trace_http_end,
-
 	.http_reset          = trace_http_reset,
 	.http_reply          = trace_http_reply,
-	.http_forward_data   = trace_http_forward_data,
 
 	/* Filter TCP data */
 	.tcp_data         = trace_tcp_data,

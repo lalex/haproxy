@@ -28,9 +28,9 @@
 
 #include <types/http_htx.h>
 
-extern struct buffer htx_err_chunks[HTTP_ERR_SIZE];
+extern struct buffer http_err_chunks[HTTP_ERR_SIZE];
 
-struct htx_sl *http_find_stline(struct htx *htx);
+struct htx_sl *http_get_stline(struct htx *htx);
 int http_find_header(const struct htx *htx, const struct ist name, struct http_hdr_ctx *ctx, int full);
 int http_add_header(struct htx *htx, const struct ist n, const struct ist v);
 int http_replace_stline(struct htx *htx, const struct ist p1, const struct ist p2, const struct ist p3);
@@ -47,5 +47,6 @@ unsigned int http_get_htx_hdr(const struct htx *htx, const struct ist hdr,
 			      int occ, struct http_hdr_ctx *ctx, char **vptr, size_t *vlen);
 unsigned int http_get_htx_fhdr(const struct htx *htx, const struct ist hdr,
 			       int occ, struct http_hdr_ctx *ctx, char **vptr, size_t *vlen);
+int http_str_to_htx(struct buffer *buf, struct ist raw);
 
 #endif /* _PROTO_HTTP_HTX_H */

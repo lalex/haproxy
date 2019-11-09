@@ -49,7 +49,7 @@
 static void sockpair_add_listener(struct listener *listener, int port);
 static int sockpair_bind_listener(struct listener *listener, char *errmsg, int errlen);
 static int sockpair_bind_listeners(struct protocol *proto, char *errmsg, int errlen);
-static int sockpair_connect_server(struct connection *conn, int data, int delack);
+static int sockpair_connect_server(struct connection *conn, int flags);
 
 /* Note: must not be declared <const> as its list will be overwritten */
 static struct protocol proto_sockpair = {
@@ -80,6 +80,9 @@ INITCALL1(STG_REGISTER, protocol_register, &proto_sockpair);
 /* Add <listener> to the list of sockpair listeners (port is ignored). The
  * listener's state is automatically updated from LI_INIT to LI_ASSIGNED.
  * The number of listeners for the protocol is updated.
+ *
+ * Must be called with proto_lock held.
+ *
  */
 static void sockpair_add_listener(struct listener *listener, int port)
 {
@@ -96,6 +99,8 @@ static void sockpair_add_listener(struct listener *listener, int port)
  * The sockets will be registered but not added to any fd_set, in order not to
  * loose them across the fork(). A call to uxst_enable_listeners() is needed
  * to complete initialization.
+ *
+ * Must be called with proto_lock held.
  *
  * The return value is composed from ERR_NONE, ERR_RETRYABLE and ERR_FATAL.
  */
@@ -153,7 +158,7 @@ static int sockpair_bind_listener(struct listener *listener, char *errmsg, int e
 	listener->state = LI_LISTEN;
 
 	fd_insert(fd, listener, listener->proto->accept,
-	          thread_mask(listener->bind_conf->bind_thread[relative_pid-1]));
+	          thread_mask(listener->bind_conf->bind_thread));
 
 	return err;
 
@@ -215,7 +220,7 @@ int send_fd_uxst(int fd, int send_fd)
  * This function works like uxst_connect_server but instead of creating a
  * socket and establishing a connection, it creates a pair of connected
  * sockets, and send one of them through the destination FD. The destination FD
- * is stored in addr.to->sin_addr.s_addr during configuration parsing.
+ * is stored in conn->dst->sin_addr.s_addr during configuration parsing.
  *
  * conn->target may point either to a valid server or to a backend, depending
  * on conn->target. Only OBJ_TYPE_PROXY and OBJ_TYPE_SERVER are supported. The
@@ -237,12 +242,12 @@ int send_fd_uxst(int fd, int send_fd)
  * The connection's fd is inserted only when SF_ERR_NONE is returned, otherwise
  * it's invalid and the caller has nothing to do.
  */
-static int sockpair_connect_server(struct connection *conn, int data, int delack)
+static int sockpair_connect_server(struct connection *conn, int flags)
 {
 	int sv[2], fd, dst_fd = -1;
 
 	/* the FD is stored in the sockaddr struct */
-	dst_fd = ((struct sockaddr_in *)&conn->addr.to)->sin_addr.s_addr;
+	dst_fd = ((struct sockaddr_in *)conn->dst)->sin_addr.s_addr;
 
 	if (obj_type(conn->target) != OBJ_TYPE_PROXY &&
 	    obj_type(conn->target) != OBJ_TYPE_SERVER) {
@@ -289,7 +294,8 @@ static int sockpair_connect_server(struct connection *conn, int data, int delack
 	}
 
 	/* if a send_proxy is there, there are data */
-	data |= conn->send_proxy_ofs;
+	if (conn->send_proxy_ofs)
+		flags |= CONNECT_HAS_DATA;
 
 	if (global.tune.server_sndbuf)
                 setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &global.tune.server_sndbuf, sizeof(global.tune.server_sndbuf));
@@ -326,20 +332,7 @@ static int sockpair_connect_server(struct connection *conn, int data, int delack
 		return SF_ERR_RESOURCE;
 	}
 
-	if (conn->flags & (CO_FL_HANDSHAKE | CO_FL_WAIT_L4_CONN)) {
-		conn_sock_want_send(conn);  /* for connect status, proxy protocol or SSL */
-	}
-	else {
-		/* If there's no more handshake, we need to notify the data
-		 * layer when the connection is already OK otherwise we'll have
-		 * no other opportunity to do it later (eg: health checks).
-		 */
-		data = 1;
-	}
-
-	if (data)
-		conn_xprt_want_send(conn);  /* prepare to send data if any */
-
+	conn_xprt_want_send(conn);  /* for connect status, proxy protocol or SSL */
 	return SF_ERR_NONE;  /* connection is OK */
 }
 

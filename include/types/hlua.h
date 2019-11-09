@@ -6,11 +6,13 @@
 #include <lua.h>
 #include <lauxlib.h>
 
+#include <common/regex.h>
 #include <common/xref.h>
 
-#include <types/proto_http.h>
+#include <types/http_ana.h>
 #include <types/proxy.h>
 #include <types/server.h>
+#include <types/stick_table.h>
 
 #define CLASS_CORE         "Core"
 #define CLASS_TXN          "TXN"
@@ -41,7 +43,8 @@ struct stream;
 #define HLUA_F_AS_STRING    0x01
 #define HLUA_F_MAY_USE_HTTP 0x02
 
-#define HLUA_TXN_NOTERM 0x00000001
+#define HLUA_TXN_NOTERM   0x00000001
+#define HLUA_TXN_HTTP_RDY 0x00000002 /* Set if the txn is HTTP ready for the defined direction */
 
 #define HLUA_CONCAT_BLOCSZ 2048
 

@@ -33,6 +33,7 @@
 #include <common/istbuf.h>
 #include <common/memory.h>
 
+#include <proto/activity.h>
 
 /* an element of the <buffer_wq> list. It represents an object that need to
  * acquire a buffer to continue its process. */
@@ -77,8 +78,10 @@ static inline struct buffer *b_alloc(struct buffer *buf)
 
 	*buf = BUF_WANTED;
 	area = pool_alloc_dirty(pool_head_buffer);
-	if (unlikely(!area))
+	if (unlikely(!area)) {
+		activity[tid].buf_wait++;
 		return NULL;
+	}
 
 	buf->area = area;
 	buf->size = pool_head_buffer->size;
@@ -106,24 +109,26 @@ static inline struct buffer *b_alloc_fast(struct buffer *buf)
 	return buf;
 }
 
-/* Releases buffer <buf> (no check of emptiness) */
-static inline void __b_drop(struct buffer *buf)
+/* Releases buffer <buf> (no check of emptiness). The buffer's head is marked
+ * empty.
+ */
+static inline void __b_free(struct buffer *buf)
 {
-	pool_free(pool_head_buffer, buf->area);
-}
+	char *area = buf->area;
 
-/* Releases buffer <buf> if allocated. */
-static inline void b_drop(struct buffer *buf)
-{
-	if (buf->size)
-		__b_drop(buf);
+	/* let's first clear the area to save an occasional "show sess all"
+	 * glancing over our shoulder from getting a dangling pointer.
+	 */
+	*buf = BUF_NULL;
+	__ha_barrier_store();
+	pool_free(pool_head_buffer, area);
 }
 
 /* Releases buffer <buf> if allocated, and marks it empty. */
 static inline void b_free(struct buffer *buf)
 {
-	b_drop(buf);
-	*buf = BUF_NULL;
+	if (buf->size)
+		__b_free(buf);
 }
 
 /* Ensures that <buf> is allocated. If an allocation is needed, it ensures that
@@ -175,8 +180,10 @@ static inline struct buffer *b_alloc_margin(struct buffer *buf, int margin)
 	HA_SPIN_UNLOCK(POOL_LOCK, &pool_head_buffer->lock);
 #endif
 
-	if (unlikely(!area))
+	if (unlikely(!area)) {
+		activity[tid].buf_wait++;
 		return NULL;
+	}
 
  done:
 	buf->area = area;
@@ -196,12 +203,12 @@ void __offer_buffer(void *from, unsigned int threshold);
 
 static inline void offer_buffers(void *from, unsigned int threshold)
 {
-	HA_SPIN_LOCK(BUF_WQ_LOCK, &buffer_wq_lock);
-	if (LIST_ISEMPTY(&buffer_wq)) {
-		HA_SPIN_UNLOCK(BUF_WQ_LOCK, &buffer_wq_lock);
+	if (LIST_ISEMPTY(&buffer_wq))
 		return;
-	}
-	__offer_buffer(from, threshold);
+
+	HA_SPIN_LOCK(BUF_WQ_LOCK, &buffer_wq_lock);
+	if (!LIST_ISEMPTY(&buffer_wq))
+		__offer_buffer(from, threshold);
 	HA_SPIN_UNLOCK(BUF_WQ_LOCK, &buffer_wq_lock);
 }
 

@@ -26,7 +26,7 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
+#include <inttypes.h>
 #include <unistd.h>
 
 #include <common/config.h>
@@ -228,9 +228,10 @@ static inline void *__pool_get_first(struct pool_head *pool)
 		new.seq = cmp.seq + 1;
 		__ha_barrier_load();
 		new.free_list = *POOL_LINK(pool, cmp.free_list);
-	} while (__ha_cas_dw((void *)&pool->free_list, (void *)&cmp, (void *)&new) == 0);
+	} while (HA_ATOMIC_DWCAS((void *)&pool->free_list, (void *)&cmp, (void *)&new) == 0);
+	__ha_barrier_atomic_store();
 
-	HA_ATOMIC_ADD(&pool->used, 1);
+	_HA_ATOMIC_ADD(&pool->used, 1);
 #ifdef DEBUG_MEMORY_POOLS
 	/* keep track of where the element was allocated from */
 	*POOL_LINK(pool, cmp.free_list) = (void *)pool;
@@ -288,8 +289,9 @@ static inline void __pool_free(struct pool_head *pool, void *ptr)
 	do {
 		*POOL_LINK(pool, ptr) = (void *)free_list;
 		__ha_barrier_store();
-	} while (!HA_ATOMIC_CAS(&pool->free_list, &free_list, ptr));
-	HA_ATOMIC_SUB(&pool->used, 1);
+	} while (!_HA_ATOMIC_CAS(&pool->free_list, &free_list, ptr));
+	__ha_barrier_atomic_store();
+	_HA_ATOMIC_SUB(&pool->used, 1);
 }
 
 /* frees an object to the local cache, possibly pushing oldest objects to the
@@ -414,14 +416,27 @@ static inline void pool_free_area(void *area, size_t __maybe_unused size)
 static inline void *pool_alloc_area(size_t size)
 {
 	size_t pad = (4096 - size) & 0xFF0;
+	int isolated;
 	void *ret;
 
+	isolated = thread_isolated();
+	if (!isolated)
+		thread_harmless_now();
 	ret = mmap(NULL, (size + 4095) & -4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-	if (ret == MAP_FAILED)
-		return NULL;
-	if (pad >= sizeof(void *))
-		*(void **)(ret + pad - sizeof(void *)) = ret + pad;
-	return ret + pad;
+	if (ret != MAP_FAILED) {
+		/* let's dereference the page before returning so that the real
+		 * allocation in the system is performed without holding the lock.
+		 */
+		*(int *)ret = 0;
+		if (pad >= sizeof(void *))
+			*(void **)(ret + pad - sizeof(void *)) = ret + pad;
+		ret += pad;
+	} else {
+		ret = NULL;
+	}
+	if (!isolated)
+		thread_harmless_end();
+	return ret;
 }
 
 /* frees an area <area> of size <size> allocated by pool_alloc_area(). The
@@ -437,7 +452,9 @@ static inline void pool_free_area(void *area, size_t size)
 	if (pad >= sizeof(void *) && *(void **)(area - sizeof(void *)) != area)
 		*(volatile int *)0 = 0;
 
+	thread_harmless_now();
 	munmap(area - pad, (size + 4095) & -4096);
+	thread_harmless_end();
 }
 
 #endif /* DEBUG_UAF */
@@ -471,7 +488,6 @@ static inline void *pool_alloc(struct pool_head *pool)
 static inline void pool_free(struct pool_head *pool, void *ptr)
 {
         if (likely(ptr != NULL)) {
-		HA_SPIN_LOCK(POOL_LOCK, &pool->lock);
 #ifdef DEBUG_MEMORY_POOLS
 		/* we'll get late corruption if we refill to the wrong pool or double-free */
 		if (*POOL_LINK(pool, ptr) != (void *)pool)
@@ -479,16 +495,20 @@ static inline void pool_free(struct pool_head *pool, void *ptr)
 #endif
 
 #ifndef DEBUG_UAF /* normal pool behaviour */
+		HA_SPIN_LOCK(POOL_LOCK, &pool->lock);
 		*POOL_LINK(pool, ptr) = (void *)pool->free_list;
-                pool->free_list = (void *)ptr;
+		pool->free_list = (void *)ptr;
+		pool->used--;
+		HA_SPIN_UNLOCK(POOL_LOCK, &pool->lock);
 #else  /* release the entry for real to detect use after free */
 		/* ensure we crash on double free or free of a const area*/
 		*(uint32_t *)ptr = 0xDEADADD4;
 		pool_free_area(ptr, pool->size + POOL_EXTRA);
+		HA_SPIN_LOCK(POOL_LOCK, &pool->lock);
 		pool->allocated--;
-#endif /* DEBUG_UAF */
-                pool->used--;
+		pool->used--;
 		HA_SPIN_UNLOCK(POOL_LOCK, &pool->lock);
+#endif /* DEBUG_UAF */
 	}
 }
 #endif /* CONFIG_HAP_LOCKLESS_POOLS */

@@ -16,7 +16,6 @@
 #include <common/http-hdr.h>
 
 #include <proto/channel.h>
-#include <proto/hdr_idx.h>
 
 /* Parse the Content-Length header field of an HTTP/1 request. The function
  * checks all possible occurrences of a comma-delimited value, and verifies
@@ -132,15 +131,20 @@ void h1_parse_xfer_enc_header(struct h1m *h1m, struct ist value)
  * "keep-alive", and "upgrade" values, and updating h1m->flags according to
  * what was found there. Note that flags are only added, not removed, so the
  * function is safe for being called multiple times if multiple occurrences
- * are found.
+ * are found. If the flag H1_MF_CLEAN_CONN_HDR, the header value is cleaned
+ * up from "keep-alive" and "close" values. To do so, the header value is
+ * rewritten in place and its length is updated.
  */
-void h1_parse_connection_header(struct h1m *h1m, struct ist value)
+void h1_parse_connection_header(struct h1m *h1m, struct ist *value)
 {
-	char *e, *n;
+	char *e, *n, *p;
 	struct ist word;
 
-	word.ptr = value.ptr - 1; // -1 for next loop's pre-increment
-	e = value.ptr + value.len;
+	word.ptr = value->ptr - 1; // -1 for next loop's pre-increment
+	p = value->ptr;
+	e = value->ptr + value->len;
+	if (h1m->flags & H1_MF_CLEAN_CONN_HDR)
+		value->len = 0;
 
 	while (++word.ptr < e) {
 		/* skip leading delimitor and blanks */
@@ -154,14 +158,33 @@ void h1_parse_connection_header(struct h1m *h1m, struct ist value)
 		while (word.len && HTTP_IS_LWS(word.ptr[word.len-1]))
 			word.len--;
 
-		if (isteqi(word, ist("keep-alive")))
+		if (isteqi(word, ist("keep-alive"))) {
 			h1m->flags |= H1_MF_CONN_KAL;
-		else if (isteqi(word, ist("close")))
+			if (h1m->flags & H1_MF_CLEAN_CONN_HDR)
+				goto skip_val;
+		}
+		else if (isteqi(word, ist("close"))) {
 			h1m->flags |= H1_MF_CONN_CLO;
+			if (h1m->flags & H1_MF_CLEAN_CONN_HDR)
+				goto skip_val;
+		}
 		else if (isteqi(word, ist("upgrade")))
 			h1m->flags |= H1_MF_CONN_UPG;
 
-		word.ptr = n;
+		if (h1m->flags & H1_MF_CLEAN_CONN_HDR) {
+			if (value->ptr + value->len == p) {
+				/* no rewrite done till now */
+				value->len = n - value->ptr;
+			}
+			else {
+				if (value->len)
+					value->ptr[value->len++] = ',';
+				istcat(value, word, e - value->ptr);
+			}
+		}
+
+	  skip_val:
+		word.ptr = p = n;
 	}
 }
 
@@ -259,6 +282,7 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 	union h1_sl sl;
 	int skip_update;
 	int restarting;
+	int host_idx;
 	struct ist n, v;       /* header name and value during parsing */
 
 	skip = 0; // do it only once to keep track of the leading CRLF.
@@ -267,6 +291,7 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 	hdr_count = sol = col = eol = sov = 0;
 	sl.st.status = 0;
 	skip_update = restarting = 0;
+	host_idx = -1;
 
 	if (h1m->flags & H1_MF_HDRS_ONLY) {
 		state = H1_MSG_HDR_FIRST;
@@ -802,7 +827,35 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 					}
 				}
 				else if (isteqi(n, ist("connection"))) {
-					h1_parse_connection_header(h1m, v);
+					h1_parse_connection_header(h1m, &v);
+					if (!v.len) {
+						/* skip it */
+						break;
+					}
+				}
+				else if (isteqi(n, ist("host"))) {
+					if (host_idx == -1) {
+						struct ist authority;
+
+						authority = http_get_authority(sl.rq.u, 1);
+						if (authority.len && !isteqi(v, authority)) {
+							if (h1m->err_pos < -1) {
+								state = H1_MSG_HDR_L2_LWS;
+								goto http_msg_invalid;
+							}
+							if (h1m->err_pos == -1) /* capture the error pointer */
+								h1m->err_pos = ptr - start + skip; /* >= 0 now */
+						}
+						host_idx = hdr_count;
+					}
+					else {
+						if (!isteqi(v, hdr[host_idx].v)) {
+							state = H1_MSG_HDR_L2_LWS;
+							goto http_msg_invalid;
+						}
+						/* if the same host, skip it */
+						break;
+					}
 				}
 
 				http_set_hdr(&hdr[hdr_count++], n, v);
@@ -907,7 +960,8 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 	return -2;
 
  restart:
-	h1m->next  = 0;
+	h1m->flags &= ~(H1_MF_VER_11|H1_MF_CLEN|H1_MF_XFER_ENC|H1_MF_CHNK|H1_MF_CONN_KAL|H1_MF_CONN_CLO|H1_MF_CONN_UPG);
+	h1m->curr_len = h1m->body_len = h1m->next  = 0;
 	if (h1m->flags & H1_MF_RESP)
 		h1m->state = H1_MSG_RPBEFORE;
 	else

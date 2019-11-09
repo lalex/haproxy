@@ -25,6 +25,8 @@
 #include <common/mini-clist.h>
 #include <common/standard.h>
 
+#include <types/activity.h>
+
 #include <proto/applet.h>
 #include <proto/cli.h>
 #include <proto/channel.h>
@@ -64,6 +66,7 @@ struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 	struct pool_head *entry;
 	struct list *start;
 	unsigned int align;
+	int thr, idx;
 
 	/* We need to store a (void *) at the end of the chunks. Since we know
 	 * that the malloc() function will never return such a small size,
@@ -129,6 +132,13 @@ struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 		pool->size = size;
 		pool->flags = flags;
 		LIST_ADDQ(start, &pool->list);
+
+		/* update per-thread pool cache if necessary */
+		idx = pool_get_index(pool);
+		if (idx >= 0) {
+			for (thr = 0; thr < MAX_THREADS; thr++)
+				pool_cache[thr][idx].size = size;
+		}
 	}
 	pool->users++;
 #ifndef CONFIG_HAP_LOCKLESS_POOLS
@@ -159,15 +169,18 @@ void *__pool_refill_alloc(struct pool_head *pool, unsigned int avail)
 
 	while (1) {
 		if (limit && allocated >= limit) {
-			HA_ATOMIC_ADD(&pool->allocated, allocated - allocated_orig);
+			_HA_ATOMIC_ADD(&pool->allocated, allocated - allocated_orig);
+			activity[tid].pool_fail++;
 			return NULL;
 		}
 
 		ptr = malloc(size + POOL_EXTRA);
 		if (!ptr) {
-			HA_ATOMIC_ADD(&pool->failed, 1);
-			if (failed)
+			_HA_ATOMIC_ADD(&pool->failed, 1);
+			if (failed) {
+				activity[tid].pool_fail++;
 				return NULL;
+			}
 			failed++;
 			pool_gc(pool);
 			continue;
@@ -179,11 +192,12 @@ void *__pool_refill_alloc(struct pool_head *pool, unsigned int avail)
 		do {
 			*POOL_LINK(pool, ptr) = free_list;
 			__ha_barrier_store();
-		} while (HA_ATOMIC_CAS(&pool->free_list, &free_list, ptr) == 0);
+		} while (_HA_ATOMIC_CAS(&pool->free_list, &free_list, ptr) == 0);
 	}
+	__ha_barrier_atomic_store();
 
-	HA_ATOMIC_ADD(&pool->allocated, allocated - allocated_orig);
-	HA_ATOMIC_ADD(&pool->used, 1);
+	_HA_ATOMIC_ADD(&pool->allocated, allocated - allocated_orig);
+	_HA_ATOMIC_ADD(&pool->used, 1);
 
 #ifdef DEBUG_MEMORY_POOLS
 	/* keep track of where the element was allocated from */
@@ -210,7 +224,8 @@ void pool_flush(struct pool_head *pool)
 		return;
 	do {
 		next = pool->free_list;
-	} while (!HA_ATOMIC_CAS(&pool->free_list, &next, NULL));
+	} while (!_HA_ATOMIC_CAS(&pool->free_list, &next, NULL));
+	__ha_barrier_atomic_store();
 	while (next) {
 		temp = next;
 		next = *POOL_LINK(pool, temp);
@@ -218,7 +233,7 @@ void pool_flush(struct pool_head *pool)
 		free(temp);
 	}
 	pool->free_list = next;
-	HA_ATOMIC_SUB(&pool->allocated, removed);
+	_HA_ATOMIC_SUB(&pool->allocated, removed);
 	/* here, we should have pool->allocate == pool->used */
 }
 
@@ -235,7 +250,7 @@ void pool_gc(struct pool_head *pool_ctx)
 	int cur_recurse = 0;
 	struct pool_head *entry;
 
-	if (recurse || !HA_ATOMIC_CAS(&recurse, &cur_recurse, 1))
+	if (recurse || !_HA_ATOMIC_CAS(&recurse, &cur_recurse, 1))
 		return;
 
 	list_for_each_entry(entry, &pools, list) {
@@ -250,14 +265,14 @@ void pool_gc(struct pool_head *pool_ctx)
 				break;
 			new.free_list = *POOL_LINK(entry, cmp.free_list);
 			new.seq = cmp.seq + 1;
-			if (__ha_cas_dw(&entry->free_list, &cmp, &new) == 0)
+			if (HA_ATOMIC_DWCAS(&entry->free_list, &cmp, &new) == 0)
 				continue;
 			free(cmp.free_list);
-			HA_ATOMIC_SUB(&entry->allocated, 1);
+			_HA_ATOMIC_SUB(&entry->allocated, 1);
 		}
 	}
 
-	HA_ATOMIC_STORE(&recurse, 0);
+	_HA_ATOMIC_STORE(&recurse, 0);
 }
 
 /* frees an object to the local cache, possibly pushing oldest objects to the
@@ -315,14 +330,28 @@ void *__pool_refill_alloc(struct pool_head *pool, unsigned int avail)
 	avail += pool->used;
 
 	while (1) {
-		if (pool->limit && pool->allocated >= pool->limit)
+		if (pool->limit && pool->allocated >= pool->limit) {
+			activity[tid].pool_fail++;
 			return NULL;
+		}
 
+		HA_SPIN_UNLOCK(POOL_LOCK, &pool->lock);
 		ptr = pool_alloc_area(pool->size + POOL_EXTRA);
+#ifdef DEBUG_MEMORY_POOLS
+		/* keep track of where the element was allocated from. This
+		 * is done out of the lock so that the system really allocates
+		 * the data without harming other threads waiting on the lock.
+		 */
+		if (ptr)
+			*POOL_LINK(pool, ptr) = (void *)pool;
+#endif
+		HA_SPIN_LOCK(POOL_LOCK, &pool->lock);
 		if (!ptr) {
 			pool->failed++;
-			if (failed)
+			if (failed) {
+				activity[tid].pool_fail++;
 				return NULL;
+			}
 			failed++;
 			pool_gc(pool);
 			continue;
@@ -334,10 +363,6 @@ void *__pool_refill_alloc(struct pool_head *pool, unsigned int avail)
 		pool->free_list = ptr;
 	}
 	pool->used++;
-#ifdef DEBUG_MEMORY_POOLS
-	/* keep track of where the element was allocated from */
-	*POOL_LINK(pool, ptr) = (void *)pool;
-#endif
 	return ptr;
 }
 void *pool_refill_alloc(struct pool_head *pool, unsigned int avail)
@@ -354,21 +379,24 @@ void *pool_refill_alloc(struct pool_head *pool, unsigned int avail)
  */
 void pool_flush(struct pool_head *pool)
 {
-	void *temp, *next;
+	void *temp;
+
 	if (!pool)
 		return;
 
-	HA_SPIN_LOCK(POOL_LOCK, &pool->lock);
-	next = pool->free_list;
-	while (next) {
-		temp = next;
-		next = *POOL_LINK(pool, temp);
+	while (1) {
+		HA_SPIN_LOCK(POOL_LOCK, &pool->lock);
+		temp = pool->free_list;
+		if (!temp) {
+			HA_SPIN_UNLOCK(POOL_LOCK, &pool->lock);
+			break;
+		}
+		pool->free_list = *POOL_LINK(pool, temp);
 		pool->allocated--;
+		HA_SPIN_UNLOCK(POOL_LOCK, &pool->lock);
 		pool_free_area(temp, pool->size + POOL_EXTRA);
 	}
-	pool->free_list = next;
-	HA_SPIN_UNLOCK(POOL_LOCK, &pool->lock);
-	/* here, we should have pool->allocate == pool->used */
+	/* here, we should have pool->allocated == pool->used */
 }
 
 /*
@@ -386,7 +414,7 @@ void pool_gc(struct pool_head *pool_ctx)
 	int cur_recurse = 0;
 	struct pool_head *entry;
 
-	if (recurse || !HA_ATOMIC_CAS(&recurse, &cur_recurse, 1))
+	if (recurse || !_HA_ATOMIC_CAS(&recurse, &cur_recurse, 1))
 		return;
 
 	list_for_each_entry(entry, &pools, list) {
@@ -400,14 +428,18 @@ void pool_gc(struct pool_head *pool_ctx)
 			temp = next;
 			next = *POOL_LINK(entry, temp);
 			entry->allocated--;
+			if (entry != pool_ctx)
+				HA_SPIN_UNLOCK(POOL_LOCK, &entry->lock);
 			pool_free_area(temp, entry->size + POOL_EXTRA);
+			if (entry != pool_ctx)
+				HA_SPIN_LOCK(POOL_LOCK, &entry->lock);
 		}
 		entry->free_list = next;
 		if (entry != pool_ctx)
 			HA_SPIN_UNLOCK(POOL_LOCK, &entry->lock);
 	}
 
-	HA_ATOMIC_STORE(&recurse, 0);
+	_HA_ATOMIC_STORE(&recurse, 0);
 }
 #endif
 
@@ -592,7 +624,7 @@ int mem_should_fail(const struct pool_head *pool)
 		else
 			ret = 0;
 	}
-	HA_SPIN_LOCK(START_LOCK, &mem_fail_lock);
+	HA_SPIN_LOCK(OTHER_LOCK, &mem_fail_lock);
 	n = snprintf(&mem_fail_str[mem_fail_cur_idx * MEM_FAIL_MAX_CHAR],
 	    MEM_FAIL_MAX_CHAR - 2,
 	    "%d %.18s %d %d", mem_fail_cur_idx, pool->name, ret, tid);
@@ -605,7 +637,7 @@ int mem_should_fail(const struct pool_head *pool)
 	mem_fail_cur_idx++;
 	if (mem_fail_cur_idx == MEM_FAIL_MAX_STR)
 		mem_fail_cur_idx = 0;
-	HA_SPIN_UNLOCK(START_LOCK, &mem_fail_lock);
+	HA_SPIN_UNLOCK(OTHER_LOCK, &mem_fail_lock);
 	return ret;
 
 }

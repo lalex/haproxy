@@ -22,6 +22,7 @@
 #ifndef _TYPES_APPLET_H
 #define _TYPES_APPLET_H
 
+#include <types/freq_ctr.h>
 #include <types/hlua.h>
 #include <types/obj_type.h>
 #include <types/proxy.h>
@@ -49,6 +50,7 @@ struct applet {
 
 #define APPCTX_CLI_ST1_PROMPT  (1 << 0)
 #define APPCTX_CLI_ST1_PAYLOAD (1 << 1)
+#define APPCTX_CLI_ST1_NOLF    (1 << 2)
 
 /* Context of a running applet. */
 struct appctx {
@@ -70,6 +72,7 @@ struct appctx {
 	struct buffer_wait buffer_wait; /* position in the list of objects waiting for a buffer */
 	unsigned long thread_mask;      /* mask of thread IDs authorized to process the applet */
 	struct task *t;                  /* task associated to the applet */
+	struct freq_ctr call_rate;       /* appctx call rate */
 
 	union {
 		struct {
@@ -102,13 +105,16 @@ struct appctx {
 			const char *msg;        /* pointer to a persistent message to be returned in CLI_ST_PRINT state */
 			int severity;           /* severity of the message to be returned according to (syslog) rfc5424 */
 			char *err;              /* pointer to a 'must free' message to be returned in CLI_ST_PRINT_FREE state */
-			void *p0, *p1;          /* general purpose pointers and integers for registered commands, initialized */
-			int i0, i1;             /* to 0 by the CLI before first invocation of the keyword parser. */
+			struct list l0;         /* General purpose list element, pointers, offsets and integers for... */
+			void *p0, *p1;          /* ...registered commands, initialized to 0 by the CLI before first... */
+			size_t o0, o1;          /* ...invocation of the keyword parser, except for the list element which... */
+			int i0, i1;             /* ...is initialized with LIST_INIT(). */
 		} cli;                          /* context used by the CLI */
 		struct {
 			struct cache_entry *entry;  /* Entry to be sent from cache. */
 			unsigned int sent;          /* The number of bytes already sent for this cache entry. */
 			unsigned int offset;        /* start offset of remaining data relative to beginning of the next block */
+			unsigned int rem_data;      /* Remaing bytes for the last data block (HTX only, 0 means process next block) */
 			struct shared_block *next;  /* The next block of data to be sent for this cache entry. */
 		} cache;
 		/* all entries below are used by various CLI commands, please
@@ -142,7 +148,7 @@ struct appctx {
 		} errors;
 		struct {
 			void *target;		/* table we want to dump, or NULL for all */
-			struct proxy *proxy;	/* table being currently dumped (first if NULL) */
+			struct stktable *t;	/* table being currently dumped (first if NULL) */
 			struct stksess *entry;	/* last entry we were trying to dump (or first if NULL) */
 			long long value;	/* value to compare against */
 			signed char data_type;	/* type of data to compare, or -1 if none */
@@ -161,6 +167,17 @@ struct appctx {
 			struct task *task;
 			struct hlua_function *fcn;
 		} hlua_cli;
+		struct {
+			void *target;
+			struct peers *peers; /* "peers" section being currently dumped. */
+			struct peer *peer;   /* "peer" being currently dumped. */
+		} cfgpeers;
+		struct {
+			char *path;
+			struct ckch_store *old_ckchs;
+			struct ckch_store *new_ckchs;
+			struct ckch_inst *next_ckchi;
+		} ssl;
 		/* NOTE: please add regular applet contexts (ie: not
 		 * CLI-specific ones) above, before "cli".
 		 */

@@ -28,7 +28,7 @@
 #ifndef _COMMON_ISTBUF_H
 #define _COMMON_ISTBUF_H
 
-#include <stdint.h>
+#include <inttypes.h>
 #include <common/buf.h>
 #include <common/ist.h>
 
@@ -58,6 +58,29 @@ static inline ssize_t b_isteq(const struct buffer *b, size_t o, size_t n, const 
 	while (r.len--) {
 		if (*p++ != *r.ptr++)
 			return -1;
+		if (unlikely(p == end))
+			p = b_orig(b);
+	}
+	return ist.len;
+}
+
+/* Same as b_isteq but case-insensitive */
+static inline ssize_t b_isteqi(const struct buffer *b, size_t o, size_t n, const struct ist ist)
+{
+	struct ist r = ist;
+	const char *p;
+	const char *end = b_wrap(b);
+
+	if (n < r.len)
+		return 0;
+
+	p = b_peek(b, o);
+	while (r.len--) {
+		if (*p != *r.ptr &&
+		    ist_lc[(unsigned char)*p] != ist_lc[(unsigned char)*r.ptr])
+			return -1;
+		p++;
+		r.ptr++;
 		if (unlikely(p == end))
 			p = b_orig(b);
 	}

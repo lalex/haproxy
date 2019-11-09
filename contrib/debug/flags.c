@@ -3,7 +3,7 @@
 
 #include <types/channel.h>
 #include <types/connection.h>
-#include <types/proto_http.h>
+#include <types/http_ana.h>
 #include <types/stream.h>
 #include <types/stream_interface.h>
 #include <types/task.h>
@@ -71,6 +71,7 @@ void show_chn_flags(unsigned int f)
 	}
 
 	SHOW_FLAG(f, CF_ISRESP);
+	SHOW_FLAG(f, CF_EOI);
 	SHOW_FLAG(f, CF_FLT_ANALYZE);
 	SHOW_FLAG(f, CF_WAKE_ONCE);
 	SHOW_FLAG(f, CF_NEVER_WAIT);
@@ -96,7 +97,6 @@ void show_chn_flags(unsigned int f)
 	SHOW_FLAG(f, CF_READ_NOEXP);
 	SHOW_FLAG(f, CF_SHUTR_NOW);
 	SHOW_FLAG(f, CF_SHUTR);
-	SHOW_FLAG(f, CF_WAKE_CONNECT);
 	SHOW_FLAG(f, CF_READ_ERROR);
 	SHOW_FLAG(f, CF_READ_TIMEOUT);
 	SHOW_FLAG(f, CF_READ_PARTIAL);
@@ -129,6 +129,8 @@ void show_conn_flags(unsigned int f)
 	SHOW_FLAG(f, CO_FL_ERROR);
 	SHOW_FLAG(f, CO_FL_SOCK_WR_SH);
 	SHOW_FLAG(f, CO_FL_SOCK_RD_SH);
+	SHOW_FLAG(f, CO_FL_SOCKS4_RECV);
+	SHOW_FLAG(f, CO_FL_SOCKS4_SEND);
 	SHOW_FLAG(f, CO_FL_EARLY_DATA);
 	SHOW_FLAG(f, CO_FL_EARLY_SSL_HS);
 	SHOW_FLAG(f, CO_FL_ADDR_TO_SET);
@@ -139,10 +141,8 @@ void show_conn_flags(unsigned int f)
 	SHOW_FLAG(f, CO_FL_CTRL_READY);
 	SHOW_FLAG(f, CO_FL_CURR_WR_ENA);
 	SHOW_FLAG(f, CO_FL_XPRT_WR_ENA);
-	SHOW_FLAG(f, CO_FL_SOCK_WR_ENA);
 	SHOW_FLAG(f, CO_FL_CURR_RD_ENA);
 	SHOW_FLAG(f, CO_FL_XPRT_RD_ENA);
-	SHOW_FLAG(f, CO_FL_SOCK_RD_ENA);
 
 	if (f) {
 		printf("EXTRA(0x%08x)", f);
@@ -156,9 +156,11 @@ void show_cs_flags(unsigned int f)
 		printf("0\n");
 		return;
 	}
+	SHOW_FLAG(f, CS_FL_READ_PARTIAL);
 	SHOW_FLAG(f, CS_FL_NOT_FIRST);
+	SHOW_FLAG(f, CS_FL_KILL_CONN);
 	SHOW_FLAG(f, CS_FL_WAIT_FOR_HS);
-	SHOW_FLAG(f, CS_FL_REOS);
+	SHOW_FLAG(f, CS_FL_EOI);
 	SHOW_FLAG(f, CS_FL_EOS);
 	SHOW_FLAG(f, CS_FL_ERR_PENDING);
 	SHOW_FLAG(f, CS_FL_WANT_ROOM);
@@ -268,22 +270,8 @@ void show_txn_flags(unsigned int f)
 
 	SHOW_FLAG(f, TX_NOT_FIRST);
 	SHOW_FLAG(f, TX_USE_PX_CONN);
-	SHOW_FLAG(f, TX_HDR_CONN_KAL);
-	SHOW_FLAG(f, TX_HDR_CONN_CLO);
-	SHOW_FLAG(f, TX_HDR_CONN_PRS);
 	SHOW_FLAG(f, TX_WAIT_NEXT_RQ);
-	SHOW_FLAG(f, TX_HDR_CONN_UPG);
-	SHOW_FLAG(f, TX_PREFER_LAST);
-	SHOW_FLAG(f, TX_CON_KAL_SET);
-	SHOW_FLAG(f, TX_CON_CLO_SET);
-
-	//printf("%s", f ? "" : " | ");
-	switch (f & TX_CON_WANT_MSK) {
-	case TX_CON_WANT_KAL: /*f &= ~TX_CON_WANT_MSK ; printf("TX_CON_WANT_KAL%s", f ? " | " : "");*/ break;
-	case TX_CON_WANT_TUN: f &= ~TX_CON_WANT_MSK ; printf("TX_CON_WANT_TUN%s", f ? " | " : ""); break;
-	case TX_CON_WANT_SCL: f &= ~TX_CON_WANT_MSK ; printf("TX_CON_WANT_SCL%s", f ? " | " : ""); break;
-	case TX_CON_WANT_CLO: f &= ~TX_CON_WANT_MSK ; printf("TX_CON_WANT_CLO%s", f ? " | " : ""); break;
-	}
+	SHOW_FLAG(f, TX_CON_WANT_TUN);
 
 	SHOW_FLAG(f, TX_CACHE_COOK);
 	SHOW_FLAG(f, TX_CACHEABLE);

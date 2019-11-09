@@ -40,19 +40,6 @@
 #include <eb32sctree.h>
 #include <types/protocol.h>
 
-#ifndef LLONG_MAX
-# define LLONG_MAX 9223372036854775807LL
-# define LLONG_MIN (-LLONG_MAX - 1LL)
-#endif
-
-#ifndef ULLONG_MAX
-# define ULLONG_MAX	(LLONG_MAX * 2ULL + 1)
-#endif
-
-#ifndef LONGBITS
-#define LONGBITS  ((unsigned int)sizeof(long) * 8)
-#endif
-
 /* size used for max length of decimal representation of long long int. */
 #define NB_LLMAX_STR (sizeof("-9223372036854775807")-1)
 
@@ -74,6 +61,12 @@
  * power of 2, and 0 otherwise */
 #define POWEROF2(x) (((x) & ((x)-1)) == 0)
 
+/* DEFNULL() returns either the argument as-is, or NULL if absent. This is for
+ * use in macros arguments.
+ */
+#define DEFNULL(...) _FIRST_ARG(NULL, ##__VA_ARGS__, NULL)
+#define _FIRST_ARG(a, b, ...) b
+
 /* operators to compare values. They're ordered that way so that the lowest bit
  * serves as a negation for the test and contains all tests that are not equal.
  */
@@ -92,6 +85,12 @@ struct split_url {
 	enum http_scheme scheme;
 	const char *host;
 	int host_len;
+};
+
+/* generic structure associating a name and a value, for use in arrays */
+struct name_desc {
+	const char *name;
+	const char *desc;
 };
 
 extern THREAD_LOCAL int itoa_idx; /* index of next itoa_str to use */
@@ -206,6 +205,27 @@ static inline const char *LIM2A(unsigned long n, const char *alt)
 	if (++itoa_idx >= NB_ITOA_STR)
 		itoa_idx = 0;
 	return ret;
+}
+
+/* returns the number of bytes needed to encode <v> as a varint. Be careful, use
+ * it only with constants as it generates a large code (typ. 180 bytes). Use the
+ * varint_bytes() version instead in case of doubt.
+ */
+int varint_bytes(uint64_t v);
+static inline int __varint_bytes(uint64_t v)
+{
+	switch (v) {
+	case 0x0000000000000000 ... 0x00000000000000ef: return 1;
+	case 0x00000000000000f0 ... 0x00000000000008ef: return 2;
+	case 0x00000000000008f0 ... 0x00000000000408ef: return 3;
+	case 0x00000000000408f0 ... 0x00000000020408ef: return 4;
+	case 0x00000000020408f0 ... 0x00000001020408ef: return 5;
+	case 0x00000001020408f0 ... 0x00000081020408ef: return 6;
+	case 0x00000081020408f0 ... 0x00004081020408ef: return 7;
+	case 0x00004081020408f0 ... 0x00204081020408ef: return 8;
+	case 0x00204081020408f0 ... 0x10204081020408ef: return 9;
+	default: return 10;
+	}
 }
 
 /* Encode the integer <i> into a varint (variable-length integer). The encoded
@@ -446,7 +466,7 @@ int url2sa(const char *url, int ulen, struct sockaddr_storage *addr, struct spli
  * is returned upon error, with errno set. AF_INET, AF_INET6 and AF_UNIX are
  * supported.
  */
-int addr_to_str(struct sockaddr_storage *addr, char *str, int size);
+int addr_to_str(const struct sockaddr_storage *addr, char *str, int size);
 
 /* Tries to convert a sockaddr_storage port to text form. Upon success, the
  * address family is returned so that it's easy for the caller to adapt to the
@@ -454,7 +474,7 @@ int addr_to_str(struct sockaddr_storage *addr, char *str, int size);
  * is returned upon error, with errno set. AF_INET, AF_INET6 and AF_UNIX are
  * supported.
  */
-int port_to_str(struct sockaddr_storage *addr, char *str, int size);
+int port_to_str(const struct sockaddr_storage *addr, char *str, int size);
 
 /* check if the given address is local to the system or not. It will return
  * -1 when it's not possible to know, 0 when the address is not local, 1 when
@@ -479,14 +499,14 @@ int addr_is_local(const struct netns_entry *ns,
  */
 extern const char hextab[];
 char *encode_string(char *start, char *stop,
-		    const char escape, const fd_set *map,
+		    const char escape, const long *map,
 		    const char *string);
 
 /*
  * Same behavior, except that it encodes chunk <chunk> instead of a string.
  */
 char *encode_chunk(char *start, char *stop,
-                   const char escape, const fd_set *map,
+                   const char escape, const long *map,
                    const struct buffer *chunk);
 
 /*
@@ -498,7 +518,7 @@ char *encode_chunk(char *start, char *stop,
  * completes.
  */
 char *escape_string(char *start, char *stop,
-		    const char escape, const fd_set *map,
+		    const char escape, const long *map,
 		    const char *string);
 
 /*
@@ -509,7 +529,7 @@ char *escape_string(char *start, char *stop,
  * <stop>, and will return its position if the conversion completes.
  */
 char *escape_chunk(char *start, char *stop,
-                   const char escape, const fd_set *map,
+                   const char escape, const long *map,
                    const struct buffer *chunk);
 
 
@@ -750,6 +770,10 @@ extern time_t my_timegm(const struct tm *tm);
 extern const char *parse_time_err(const char *text, unsigned *ret, unsigned unit_flags);
 extern const char *parse_size_err(const char *text, unsigned *ret);
 
+/* special return values for the time parser */
+#define PARSE_TIME_UNDER ((char *)1)
+#define PARSE_TIME_OVER  ((char *)2)
+
 /* unit flags to pass to parse_time_err */
 #define TIME_UNIT_US   0x0000
 #define TIME_UNIT_MS   0x0001
@@ -808,7 +832,7 @@ static inline unsigned long atleast2(unsigned long a)
 }
 
 /* Simple ffs implementation. It returns the position of the lowest bit set to
- * one. It is illegal to call it with a==0 (undefined result).
+ * one, starting at 1. It is illegal to call it with a==0 (undefined result).
  */
 static inline unsigned int my_ffsl(unsigned long a)
 {
@@ -851,6 +875,50 @@ static inline unsigned int my_ffsl(unsigned long a)
 	return cnt;
 }
 
+/* Simple fls implementation. It returns the position of the highest bit set to
+ * one, starting at 1. It is illegal to call it with a==0 (undefined result).
+ */
+static inline unsigned int my_flsl(unsigned long a)
+{
+	unsigned long cnt;
+
+#if defined(__x86_64__)
+	__asm__("bsr %1,%0\n" : "=r" (cnt) : "rm" (a));
+	cnt++;
+#else
+
+	cnt = 1;
+#if LONG_MAX > 0x7FFFFFFFUL /* 64bits */
+	if (a & 0xFFFFFFFF00000000UL) {
+		a >>= 32;
+		cnt += 32;
+	}
+#endif
+	if (a & 0XFFFF0000U) {
+		a >>= 16;
+		cnt += 16;
+	}
+	if (a & 0XFF00) {
+		a >>= 8;
+		cnt += 8;
+	}
+	if (a & 0xf0) {
+		a >>= 4;
+		cnt += 4;
+	}
+	if (a & 0xc) {
+		a >>= 2;
+		cnt += 2;
+	}
+	if (a & 0x2) {
+		a >>= 1;
+		cnt += 1;
+	}
+#endif /* x86_64 */
+
+	return cnt;
+}
+
 /* Build a word with the <bits> lower bits set (reverse of my_popcountl) */
 static inline unsigned long nbits(int bits)
 {
@@ -858,6 +926,30 @@ static inline unsigned long nbits(int bits)
 		return 0;
 	else
 		return (2UL << bits) - 1;
+}
+
+/* sets bit <bit> into map <map>, which must be long-aligned */
+static inline void ha_bit_set(unsigned long bit, long *map)
+{
+	map[bit / (8 * sizeof(*map))] |= 1UL << (bit & (8 * sizeof(*map) - 1));
+}
+
+/* clears bit <bit> from map <map>, which must be long-aligned */
+static inline void ha_bit_clr(unsigned long bit, long *map)
+{
+	map[bit / (8 * sizeof(*map))] &= ~(1UL << (bit & (8 * sizeof(*map) - 1)));
+}
+
+/* flips bit <bit> from map <map>, which must be long-aligned */
+static inline void ha_bit_flip(unsigned long bit, long *map)
+{
+	map[bit / (8 * sizeof(*map))] ^= 1UL << (bit & (8 * sizeof(*map) - 1));
+}
+
+/* returns non-zero if bit <bit> from map <map> is set, otherwise 0 */
+static inline int ha_bit_test(unsigned long bit, const long *map)
+{
+	return !!(map[bit / (8 * sizeof(*map))] & 1UL << (bit & (8 * sizeof(*map) - 1)));
 }
 
 /*
@@ -937,6 +1029,20 @@ static inline unsigned int __full_hash(unsigned int a)
 	 */
 	return a * 3221225473U;
 }
+
+/* Return the bit position in mask <m> of the nth bit set of rank <r>, between
+ * 0 and LONGBITS-1 included, starting from the left. For example ranks 0,1,2,3
+ * for mask 0x55 will be 6, 4, 2 and 0 respectively. This algorithm is based on
+ * a popcount variant and is described here :
+ *   https://graphics.stanford.edu/~seander/bithacks.html
+ */
+unsigned int mask_find_rank_bit(unsigned int r, unsigned long m);
+unsigned int mask_find_rank_bit_fast(unsigned int r, unsigned long m,
+                                     unsigned long a, unsigned long b,
+                                     unsigned long c, unsigned long d);
+void mask_prep_rank_map(unsigned long m,
+                        unsigned long *a, unsigned long *b,
+                        unsigned long *c, unsigned long *d);
 
 /* sets the address family to AF_UNSPEC so that is_addr() does not match */
 static inline void clear_addr(struct sockaddr_storage *addr)
@@ -1165,6 +1271,17 @@ char *memprintf(char **out, const char *format, ...)
  *   free(err);
  */
 char *indent_msg(char **out, int level);
+int append_prefixed_str(struct buffer *out, const char *in, const char *pfx, char eol, int first);
+
+/* removes environment variable <name> from the environment as found in
+ * environ. This is only provided as an alternative for systems without
+ * unsetenv() (old Solaris and AIX versions). THIS IS NOT THREAD SAFE.
+ * The principle is to scan environ for each occurence of variable name
+ * <name> and to replace the matching pointers with the last pointer of
+ * the array (since variables are not ordered).
+ * It always returns 0 (success).
+ */
+int my_unsetenv(const char *name);
 
 /* Convert occurrences of environment variables in the input string to their
  * corresponding value. A variable is identified as a series of alphanumeric
@@ -1185,9 +1302,9 @@ char *env_expand(char *in);
  */
 void debug_hexdump(FILE *out, const char *pfx, const char *buf, unsigned int baseaddr, int len);
 
-/* this is used to emit traces when building with TRACE=1 */
+/* this is used to emit call traces when building with TRACE=1 */
 __attribute__((format(printf, 1, 2)))
-void trace(char *fmt, ...);
+void calltrace(char *fmt, ...);
 
 /* used from everywhere just to drain results we don't want to read and which
  * recent versions of gcc increasingly and annoyingly complain about.
@@ -1355,6 +1472,8 @@ int dump_text(struct buffer *out, const char *buf, int bsize);
 int dump_binary(struct buffer *out, const char *buf, int bsize);
 int dump_text_line(struct buffer *out, const char *buf, int bsize, int len,
                    int *line, int ptr);
+void dump_hex(struct buffer *out, const char *pfx, const void *buf, int len, int unsafe);
+int may_access(const void *ptr);
 
 /* same as realloc() except that ptr is also freed upon failure */
 static inline void *my_realloc2(void *ptr, size_t size)
@@ -1366,6 +1485,8 @@ static inline void *my_realloc2(void *ptr, size_t size)
 		free(ptr);
 	return ret;
 }
+
+int parse_dotted_uints(const char *s, unsigned int **nums, size_t *sz);
 
 /* HAP_STRING() makes a string from a literal while HAP_XSTRING() first
  * evaluates the argument and is suited to pass macros.

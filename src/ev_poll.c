@@ -57,29 +57,39 @@ static void _update_fd(int fd, int *max_add_fd)
 	 * don't check the tid_bit. First thread to see the update
 	 * takes it for every other one.
 	 */
-	if (!(en & FD_EV_POLLED_RW)) {
-		if (!polled_mask[fd]) {
+	if (!(en & FD_EV_ACTIVE_RW)) {
+		if (!(polled_mask[fd].poll_recv | polled_mask[fd].poll_send)) {
 			/* fd was not watched, it's still not */
 			return;
 		}
 		/* fd totally removed from poll list */
 		hap_fd_clr(fd, fd_evts[DIR_RD]);
 		hap_fd_clr(fd, fd_evts[DIR_WR]);
-		HA_ATOMIC_AND(&polled_mask[fd], 0);
+		_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, 0);
+		_HA_ATOMIC_AND(&polled_mask[fd].poll_send, 0);
 	}
 	else {
 		/* OK fd has to be monitored, it was either added or changed */
-		if (!(en & FD_EV_POLLED_R))
+		if (!(en & FD_EV_ACTIVE_R)) {
 			hap_fd_clr(fd, fd_evts[DIR_RD]);
-		else
+			if (polled_mask[fd].poll_recv & tid_bit)
+				_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~tid_bit);
+		} else {
 			hap_fd_set(fd, fd_evts[DIR_RD]);
+			if (!(polled_mask[fd].poll_recv & tid_bit))
+				_HA_ATOMIC_OR(&polled_mask[fd].poll_recv, tid_bit);
+		}
 
-		if (!(en & FD_EV_POLLED_W))
+		if (!(en & FD_EV_ACTIVE_W)) {
 			hap_fd_clr(fd, fd_evts[DIR_WR]);
-		else
+			if (polled_mask[fd].poll_send & tid_bit)
+				_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~tid_bit);
+		}else {
 			hap_fd_set(fd, fd_evts[DIR_WR]);
+			if (!(polled_mask[fd].poll_send & tid_bit))
+				_HA_ATOMIC_OR(&polled_mask[fd].poll_send, tid_bit);
+		}
 
-		HA_ATOMIC_OR(&polled_mask[fd], tid_bit);
 		if (fd > *max_add_fd)
 			*max_add_fd = fd;
 	}
@@ -88,7 +98,7 @@ static void _update_fd(int fd, int *max_add_fd)
 /*
  * Poll() poller
  */
-REGPRM2 static void _do_poll(struct poller *p, int exp)
+REGPRM3 static void _do_poll(struct poller *p, int exp, int wake)
 {
 	int status;
 	int fd;
@@ -106,7 +116,7 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 	for (updt_idx = 0; updt_idx < fd_nbupdt; updt_idx++) {
 		fd = fd_updt[updt_idx];
 
-		HA_ATOMIC_AND(&fdtab[fd].update_mask, ~tid_bit);
+		_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~tid_bit);
 		if (!fdtab[fd].owner) {
 			activity[tid].poll_drop++;
 			continue;
@@ -129,7 +139,7 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 			 * we don't need every thread ot take care of the
 			 * update.
 			 */
-			HA_ATOMIC_AND(&fdtab[fd].update_mask, ~all_threads_mask);
+			_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~all_threads_mask);
 			done_update_polling(fd);
 		} else
 			continue;
@@ -140,7 +150,7 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 
 	/* maybe we added at least one fd larger than maxfd */
 	for (old_maxfd = maxfd; old_maxfd <= max_add_fd; ) {
-		if (HA_ATOMIC_CAS(&maxfd, &old_maxfd, max_add_fd + 1))
+		if (_HA_ATOMIC_CAS(&maxfd, &old_maxfd, max_add_fd + 1))
 			break;
 	}
 
@@ -156,9 +166,11 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 			new_maxfd--;
 		if (new_maxfd >= old_maxfd)
 			break;
-	} while (!HA_ATOMIC_CAS(&maxfd, &old_maxfd, new_maxfd));
+	} while (!_HA_ATOMIC_CAS(&maxfd, &old_maxfd, new_maxfd));
 
 	thread_harmless_now();
+	if (sleeping_thread_mask & tid_bit)
+		_HA_ATOMIC_AND(&sleeping_thread_mask, ~tid_bit);
 
 	fd_nbupdt = 0;
 
@@ -194,7 +206,7 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 	}
 
 	/* now let's wait for events */
-	wait_time = compute_poll_timeout(exp);
+	wait_time = wake ? 0 : compute_poll_timeout(exp);
 	tv_entering_poll();
 	activity_count_runtime();
 	status = poll(poll_events, nbfd, wait_time);
@@ -219,25 +231,15 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 			continue;
 		}
 
-		/* it looks complicated but gcc can optimize it away when constants
-		 * have same values... In fact it depends on gcc :-(
-		 */
-		if (POLLIN == FD_POLL_IN && POLLOUT == FD_POLL_OUT &&
-		    POLLERR == FD_POLL_ERR && POLLHUP == FD_POLL_HUP) {
-			n = e & (POLLIN|POLLOUT|POLLERR|POLLHUP);
-		}
-		else {
-			n =     ((e & POLLIN ) ? FD_POLL_IN  : 0) |
-				((e & POLLOUT) ? FD_POLL_OUT : 0) |
-				((e & POLLERR) ? FD_POLL_ERR : 0) |
-				((e & POLLHUP) ? FD_POLL_HUP : 0);
-		}
+		n = ((e & POLLIN)    ? FD_EV_READY_R : 0) |
+		    ((e & POLLOUT)   ? FD_EV_READY_W : 0) |
+		    ((e & POLLRDHUP) ? FD_EV_SHUT_R  : 0) |
+		    ((e & POLLHUP)   ? FD_EV_SHUT_RW : 0) |
+		    ((e & POLLERR)   ? FD_EV_ERR_RW  : 0);
 
-		/* always remap RDHUP to HUP as they're used similarly */
-		if (e & POLLRDHUP) {
-			HA_ATOMIC_OR(&cur_poller.flags, HAP_POLL_F_RDHUP);
-			n |= FD_POLL_HUP;
-		}
+		if ((e & POLLRDHUP) && !(cur_poller.flags & HAP_POLL_F_RDHUP))
+			_HA_ATOMIC_OR(&cur_poller.flags, HAP_POLL_F_RDHUP);
+
 		fd_update_events(fd, n);
 	}
 

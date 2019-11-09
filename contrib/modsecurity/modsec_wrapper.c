@@ -22,10 +22,8 @@
 #include <types/stream.h>
 
 #include <proto/arg.h>
-#include <proto/hdr_idx.h>
 #include <proto/hlua.h>
 #include <proto/log.h>
-#include <proto/proto_http.h>
 #include <proto/spoe.h>
 
 #include <api.h>
@@ -325,7 +323,11 @@ int modsecurity_process(struct worker *worker, struct modsecurity_parameters *pa
 	req->content_type = apr_table_get(req->headers_in, "Content-Type");
 	req->content_encoding = apr_table_get(req->headers_in, "Content-Encoding");
 	req->hostname = apr_table_get(req->headers_in, "Host");
-	req->parsed_uri.hostname = chunk_strdup(req, req->hostname, strlen(req->hostname));
+	if (req->hostname != NULL) {
+		req->parsed_uri.hostname = chunk_strdup(req, req->hostname, strlen(req->hostname));
+	} else {
+		req->parsed_uri.hostname = NULL;
+	}
 
 	lang = apr_table_get(req->headers_in, "Content-Languages");
 	if (lang != NULL) {

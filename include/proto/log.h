@@ -54,6 +54,17 @@ extern THREAD_LOCAL char *logline;
 extern THREAD_LOCAL char *logline_rfc5424;
 
 
+/*
+ * Test if <idx> index numbered from 0 is in <rg> range with low and high
+ * limits of indexes numbered from 1.
+ */
+static inline int in_smp_log_range(struct smp_log_range *rg, unsigned int idx)
+{
+       if (idx + 1 <= rg->high && idx + 1 >= rg->low)
+               return 1;
+       return 0;
+}
+
 /* Initialize/Deinitialize log buffers used for syslog messages */
 int init_log_buffers();
 void deinit_log_buffers();
@@ -75,6 +86,10 @@ static inline int build_logline(struct stream *s, char *dst, size_t maxsize, str
  */
 void strm_log(struct stream *s);
 void sess_log(struct session *sess);
+
+/* send a applicative log with custom list of log servers */
+void app_log(struct list *logsrvs, struct buffer *tag, int level, const char *format, ...)
+	__attribute__ ((format(printf, 4, 5)));
 
 /*
  * add to the logformat linked list
@@ -130,7 +145,7 @@ void send_log(struct proxy *p, int level, const char *format, ...)
  * It doesn't care about errors nor does it report them.
  */
 
-void __send_log(struct proxy *p, int level, char *message, size_t size, char *sd, size_t sd_size);
+void __send_log(struct list *logsrvs, struct buffer *tag, int level, char *message, size_t size, char *sd, size_t sd_size);
 
 /*
  * returns log format for <fmt> or -1 if not found.

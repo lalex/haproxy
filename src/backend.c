@@ -48,7 +48,7 @@
 #include <proto/obj_type.h>
 #include <proto/payload.h>
 #include <proto/protocol.h>
-#include <proto/proto_http.h>
+#include <proto/http_ana.h>
 #include <proto/proto_tcp.h>
 #include <proto/proxy.h>
 #include <proto/queue.h>
@@ -57,11 +57,10 @@
 #include <proto/session.h>
 #include <proto/stream.h>
 #include <proto/stream_interface.h>
+#include <proto/ssl_sock.h>
 #include <proto/task.h>
 
-#ifdef USE_OPENSSL
-#include <proto/ssl_sock.h>
-#endif /* USE_OPENSSL */
+#define TRACE_SOURCE &trace_strm
 
 int be_lastsession(const struct proxy *be)
 {
@@ -324,6 +323,8 @@ static struct server *get_server_ph_post(struct stream *s, const struct server *
 	unsigned int hash = 0;
 	struct channel  *req  = &s->req;
 	struct proxy    *px   = s->be;
+	struct htx      *htx = htxbuf(&req->buf);
+	struct htx_blk  *blk;
 	unsigned int     plen = px->lbprm.arg_len;
 	unsigned long    len;
 	const char      *params, *p, *start, *end;
@@ -331,36 +332,18 @@ static struct server *get_server_ph_post(struct stream *s, const struct server *
 	if (px->lbprm.tot_weight == 0)
 		return NULL;
 
-	if (!IS_HTX_STRM(s)) {
-		struct http_txn *txn = s->txn;
-		struct http_msg *msg = &txn->req;
+	p = params = NULL;
+	len = 0;
+	for (blk = htx_get_first_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
+		enum htx_blk_type type = htx_get_blk_type(blk);
+		struct ist v;
 
-		len  = http_body_bytes(msg);
-		p = params = c_ptr(req, -http_data_rewind(msg));
-
-		if (len == 0)
-			return NULL;
-		if (len > b_wrap(&req->buf) - p)
-			len = b_wrap(&req->buf) - p;
-
-	}
-	else {
-		struct htx *htx = htxbuf(&req->buf);
-		struct htx_blk *blk;
-
-		p = params = NULL;
-		len = 0;
-		for (blk = htx_get_head_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
-			enum htx_blk_type type = htx_get_blk_type(blk);
-			struct ist v;
-
-			if (type != HTX_BLK_DATA)
-				continue;
-			v = htx_get_blk_value(htx, blk);
-			p = params = v.ptr;
-			len = v.len;
-			break;
-		}
+		if (type != HTX_BLK_DATA)
+			continue;
+		v = htx_get_blk_value(htx, blk);
+		p = params = v.ptr;
+		len = v.len;
+		break;
 	}
 
 	while (len > plen) {
@@ -431,6 +414,8 @@ static struct server *get_server_hh(struct stream *s, const struct server *avoid
 	unsigned long    len;
 	const char      *p;
 	const char *start, *end;
+	struct htx *htx = htxbuf(&s->req.buf);
+	struct http_hdr_ctx ctx = { .blk = NULL };
 
 	/* tot_weight appears to mean srv_count */
 	if (px->lbprm.tot_weight == 0)
@@ -440,40 +425,17 @@ static struct server *get_server_hh(struct stream *s, const struct server *avoid
 	if (px->lbprm.tot_used == 1)
 		goto hash_done;
 
-	if (!IS_HTX_STRM(s)) {
-		struct http_txn *txn = s->txn;
-		struct hdr_ctx   ctx = { .idx = 0 };
+	http_find_header(htx, ist2(px->lbprm.arg_str, plen), &ctx, 0);
 
-		/* if the message is chunked, we skip the chunk size, but use the value as len */
-		http_find_header2(px->lbprm.arg_str, plen, c_ptr(&s->req, -http_hdr_rewind(&txn->req)),
-				  &txn->hdr_idx, &ctx);
+	/* if the header is not found or empty, let's fallback to round robin */
+	if (!ctx.blk || !ctx.value.len)
+		return NULL;
 
-		/* if the header is not found or empty, let's fallback to round robin */
-		if (!ctx.idx || !ctx.vlen)
-			return NULL;
-
-		/* Found the param_name in the headers.
-		 * we will compute the hash based on this value ctx.val.
-		 */
-		len = ctx.vlen;
-		p = (char *)ctx.line + ctx.val;
-	}
-	else {
-		struct htx *htx = htxbuf(&s->req.buf);
-		struct http_hdr_ctx ctx = { .blk = NULL };
-
-		http_find_header(htx, ist2(px->lbprm.arg_str, plen), &ctx, 0);
-
-		/* if the header is not found or empty, let's fallback to round robin */
-		if (!ctx.blk || !ctx.value.len)
-			return NULL;
-
-		/* Found a the param_name in the headers.
-		 * we will compute the hash based on this value ctx.val.
-		 */
-		len = ctx.value.len;
-		p   = ctx.value.ptr;
-	}
+	/* Found a the param_name in the headers.
+	 * we will compute the hash based on this value ctx.val.
+	 */
+	len = ctx.value.len;
+	p   = ctx.value.ptr;
 
 	if (!px->lbprm.arg_opt1) {
 		hash = gen_hash(px, p, len);
@@ -650,14 +612,14 @@ int assign_server(struct stream *s)
 	s->target = NULL;
 
 	if ((s->be->lbprm.algo & BE_LB_KIND) != BE_LB_KIND_HI &&
-	    ((s->txn && s->txn->flags & TX_PREFER_LAST) ||
+	    ((s->sess->flags & SESS_FL_PREFER_LAST) ||
 	     (s->be->options & PR_O_PREF_LAST))) {
 		struct sess_srv_list *srv_list;
 		list_for_each_entry(srv_list, &s->sess->srv_list, srv_list) {
 			struct server *tmpsrv = objt_server(srv_list->target);
 
 			if (tmpsrv && tmpsrv->proxy == s->be &&
-			    ((s->txn && s->txn->flags & TX_PREFER_LAST) ||
+			    ((s->sess->flags & SESS_FL_PREFER_LAST) ||
 			     (!s->be->max_ka_queue ||
 			      server_has_room(tmpsrv) || (
 			      tmpsrv->nbpend + 1 < s->be->max_ka_queue))) &&
@@ -718,14 +680,14 @@ int assign_server(struct stream *s)
 			switch (s->be->lbprm.algo & BE_LB_PARM) {
 			case BE_LB_HASH_SRC:
 				conn = objt_conn(strm_orig(s));
-				if (conn && conn->addr.from.ss_family == AF_INET) {
+				if (conn && conn_get_src(conn) && conn->src->ss_family == AF_INET) {
 					srv = get_server_sh(s->be,
-							    (void *)&((struct sockaddr_in *)&conn->addr.from)->sin_addr,
+							    (void *)&((struct sockaddr_in *)conn->src)->sin_addr,
 							    4, prev_srv);
 				}
-				else if (conn && conn->addr.from.ss_family == AF_INET6) {
+				else if (conn && conn_get_src(conn) && conn->src->ss_family == AF_INET6) {
 					srv = get_server_sh(s->be,
-							    (void *)&((struct sockaddr_in6 *)&conn->addr.from)->sin6_addr,
+							    (void *)&((struct sockaddr_in6 *)conn->src)->sin6_addr,
 							    16, prev_srv);
 				}
 				else {
@@ -737,45 +699,31 @@ int assign_server(struct stream *s)
 
 			case BE_LB_HASH_URI:
 				/* URI hashing */
-				if (!s->txn || s->txn->req.msg_state < HTTP_MSG_BODY)
-					break;
-				if (!IS_HTX_STRM(s))
-					srv = get_server_uh(s->be,
-							    c_ptr(&s->req, -http_uri_rewind(&s->txn->req)),
-							    s->txn->req.sl.rq.u_l, prev_srv);
-				else {
+				if (IS_HTX_STRM(s) && s->txn->req.msg_state >= HTTP_MSG_BODY) {
 					struct ist uri;
 
-					uri = htx_sl_req_uri(http_find_stline(htxbuf(&s->req.buf)));
+					uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
 					srv = get_server_uh(s->be, uri.ptr, uri.len, prev_srv);
 				}
 				break;
 
 			case BE_LB_HASH_PRM:
 				/* URL Parameter hashing */
-				if (!s->txn || s->txn->req.msg_state < HTTP_MSG_BODY)
-					break;
-
-				if (!IS_HTX_STRM(s))
-					srv = get_server_ph(s->be,
-							    c_ptr(&s->req, -http_uri_rewind(&s->txn->req)),
-							    s->txn->req.sl.rq.u_l, prev_srv);
-				else {
+				if (IS_HTX_STRM(s) && s->txn->req.msg_state >= HTTP_MSG_BODY) {
 					struct ist uri;
 
-					uri = htx_sl_req_uri(http_find_stline(htxbuf(&s->req.buf)));
+					uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
 					srv = get_server_ph(s->be, uri.ptr, uri.len, prev_srv);
-				}
 
-				if (!srv && s->txn->meth == HTTP_METH_POST)
-					srv = get_server_ph_post(s, prev_srv);
+					if (!srv && s->txn->meth == HTTP_METH_POST)
+						srv = get_server_ph_post(s, prev_srv);
+				}
 				break;
 
 			case BE_LB_HASH_HDR:
 				/* Header Parameter hashing */
-				if (!s->txn || s->txn->req.msg_state < HTTP_MSG_BODY)
-					break;
-				srv = get_server_hh(s, prev_srv);
+				if (IS_HTX_STRM(s) && s->txn->req.msg_state >= HTTP_MSG_BODY)
+					srv = get_server_hh(s, prev_srv);
 				break;
 
 			case BE_LB_HASH_RDP:
@@ -813,8 +761,8 @@ int assign_server(struct stream *s)
 			goto out;
 		}
 		else if (srv != prev_srv) {
-			HA_ATOMIC_ADD(&s->be->be_counters.cum_lbconn, 1);
-			HA_ATOMIC_ADD(&srv->counters.cum_lbconn, 1);
+			_HA_ATOMIC_ADD(&s->be->be_counters.cum_lbconn, 1);
+			_HA_ATOMIC_ADD(&srv->counters.cum_lbconn, 1);
 		}
 		s->target = &srv->obj_type;
 	}
@@ -824,7 +772,7 @@ int assign_server(struct stream *s)
 	else if ((s->be->options & PR_O_HTTP_PROXY)) {
 		conn = cs_conn(objt_cs(s->si[1].end));
 
-		if (conn && is_addr(&conn->addr.to)) {
+		if (conn && conn->dst && is_addr(conn->dst)) {
 			/* in proxy mode, we need a valid destination address */
 			s->target = &s->be->obj_type;
 		} else {
@@ -869,37 +817,36 @@ out_ok:
  *
  * Upon successful return, the stream flag SF_ADDR_SET is set. This flag is
  * not cleared, so it's to the caller to clear it if required.
- *
- * The caller is responsible for having already assigned a connection
- * to si->end.
- *
  */
-int assign_server_address(struct stream *s, struct connection *srv_conn)
+int assign_server_address(struct stream *s)
 {
 	struct connection *cli_conn = objt_conn(strm_orig(s));
 
 	DPRINTF(stderr,"assign_server_address : s=%p\n",s);
+
+	if (!sockaddr_alloc(&s->target_addr))
+		return SRV_STATUS_INTERNAL;
 
 	if ((s->flags & SF_DIRECT) || (s->be->lbprm.algo & BE_LB_KIND)) {
 		/* A server is necessarily known for this stream */
 		if (!(s->flags & SF_ASSIGNED))
 			return SRV_STATUS_INTERNAL;
 
-		srv_conn->addr.to = __objt_server(s->target)->addr;
-		set_host_port(&srv_conn->addr.to, __objt_server(s->target)->svc_port);
+		*s->target_addr = __objt_server(s->target)->addr;
+		set_host_port(s->target_addr, __objt_server(s->target)->svc_port);
 
-		if (!is_addr(&srv_conn->addr.to) && cli_conn) {
+		if (!is_addr(s->target_addr) && cli_conn) {
 			/* if the server has no address, we use the same address
 			 * the client asked, which is handy for remapping ports
 			 * locally on multiple addresses at once. Nothing is done
 			 * for AF_UNIX addresses.
 			 */
-			conn_get_to_addr(cli_conn);
-
-			if (cli_conn->addr.to.ss_family == AF_INET) {
-				((struct sockaddr_in *)&srv_conn->addr.to)->sin_addr = ((struct sockaddr_in *)&cli_conn->addr.to)->sin_addr;
-			} else if (cli_conn->addr.to.ss_family == AF_INET6) {
-				((struct sockaddr_in6 *)&srv_conn->addr.to)->sin6_addr = ((struct sockaddr_in6 *)&cli_conn->addr.to)->sin6_addr;
+			if (!conn_get_dst(cli_conn)) {
+				/* do nothing if we can't retrieve the address */
+			} else if (cli_conn->dst->ss_family == AF_INET) {
+				((struct sockaddr_in *)s->target_addr)->sin_addr = ((struct sockaddr_in *)cli_conn->dst)->sin_addr;
+			} else if (cli_conn->dst->ss_family == AF_INET6) {
+				((struct sockaddr_in6 *)s->target_addr)->sin6_addr = ((struct sockaddr_in6 *)cli_conn->dst)->sin6_addr;
 			}
 		}
 
@@ -908,26 +855,25 @@ int assign_server_address(struct stream *s, struct connection *srv_conn)
 		if ((__objt_server(s->target)->flags & SRV_F_MAPPORTS) && cli_conn) {
 			int base_port;
 
-			conn_get_to_addr(cli_conn);
+			if (conn_get_dst(cli_conn)) {
+				/* First, retrieve the port from the incoming connection */
+				base_port = get_host_port(cli_conn->dst);
 
-			/* First, retrieve the port from the incoming connection */
-			base_port = get_host_port(&cli_conn->addr.to);
-
-			/* Second, assign the outgoing connection's port */
-			base_port += get_host_port(&srv_conn->addr.to);
-			set_host_port(&srv_conn->addr.to, base_port);
+				/* Second, assign the outgoing connection's port */
+				base_port += get_host_port(s->target_addr);
+				set_host_port(s->target_addr, base_port);
+			}
 		}
 	}
 	else if (s->be->options & PR_O_DISPATCH) {
 		/* connect to the defined dispatch addr */
-		srv_conn->addr.to = s->be->dispatch_addr;
+		*s->target_addr = s->be->dispatch_addr;
 	}
 	else if ((s->be->options & PR_O_TRANSP) && cli_conn) {
 		/* in transparent mode, use the original dest addr if no dispatch specified */
-		conn_get_to_addr(cli_conn);
-
-		if (cli_conn->addr.to.ss_family == AF_INET || cli_conn->addr.to.ss_family == AF_INET6)
-			srv_conn->addr.to = cli_conn->addr.to;
+		if (conn_get_dst(cli_conn) &&
+		    (cli_conn->dst->ss_family == AF_INET || cli_conn->dst->ss_family == AF_INET6))
+			*s->target_addr = *cli_conn->dst;
 	}
 	else if (s->be->options & PR_O_HTTP_PROXY) {
 		/* If HTTP PROXY option is set, then server is already assigned
@@ -937,9 +883,6 @@ int assign_server_address(struct stream *s, struct connection *srv_conn)
 		/* no server and no LB algorithm ! */
 		return SRV_STATUS_INTERNAL;
 	}
-
-	/* Copy network namespace from client connection */
-	srv_conn->proxy_netns = cli_conn ? cli_conn->proxy_netns : NULL;
 
 	s->flags |= SF_ADDR_SET;
 	return SRV_STATUS_OK;
@@ -994,11 +937,11 @@ int assign_server_and_queue(struct stream *s)
 					s->txn->flags |= TX_CK_DOWN;
 				}
 				s->flags |= SF_REDISP;
-				HA_ATOMIC_ADD(&prev_srv->counters.redispatches, 1);
-				HA_ATOMIC_ADD(&s->be->be_counters.redispatches, 1);
+				_HA_ATOMIC_ADD(&prev_srv->counters.redispatches, 1);
+				_HA_ATOMIC_ADD(&s->be->be_counters.redispatches, 1);
 			} else {
-				HA_ATOMIC_ADD(&prev_srv->counters.retries, 1);
-				HA_ATOMIC_ADD(&s->be->be_counters.retries, 1);
+				_HA_ATOMIC_ADD(&prev_srv->counters.retries, 1);
+				_HA_ATOMIC_ADD(&s->be->be_counters.retries, 1);
 			}
 		}
 	}
@@ -1092,51 +1035,42 @@ static void assign_tproxy_address(struct stream *s)
 	else
 		return;
 
+	if (!sockaddr_alloc(&srv_conn->src))
+		return;
+
 	switch (src->opts & CO_SRC_TPROXY_MASK) {
 	case CO_SRC_TPROXY_ADDR:
-		srv_conn->addr.from = src->tproxy_addr;
+		*srv_conn->src = src->tproxy_addr;
 		break;
 	case CO_SRC_TPROXY_CLI:
 	case CO_SRC_TPROXY_CIP:
 		/* FIXME: what can we do if the client connects in IPv6 or unix socket ? */
 		cli_conn = objt_conn(strm_orig(s));
-		if (cli_conn)
-			srv_conn->addr.from = cli_conn->addr.from;
-		else
-			memset(&srv_conn->addr.from, 0, sizeof(srv_conn->addr.from));
+		if (cli_conn && conn_get_src(cli_conn))
+			*srv_conn->src = *cli_conn->src;
+		else {
+			sockaddr_free(&srv_conn->src);
+		}
 		break;
 	case CO_SRC_TPROXY_DYN:
-		if (src->bind_hdr_occ && s->txn) {
+		if (src->bind_hdr_occ && IS_HTX_STRM(s)) {
 			char *vptr;
 			size_t vlen;
 
 			/* bind to the IP in a header */
-			((struct sockaddr_in *)&srv_conn->addr.from)->sin_family = AF_INET;
-			((struct sockaddr_in *)&srv_conn->addr.from)->sin_port = 0;
-			((struct sockaddr_in *)&srv_conn->addr.from)->sin_addr.s_addr = 0;
-			if (!IS_HTX_STRM(s)) {
-				int rewind;
-
-				c_rew(&s->req, rewind = http_hdr_rewind(&s->txn->req));
-				if (http_get_hdr(&s->txn->req, src->bind_hdr_name, src->bind_hdr_len,
-						 &s->txn->hdr_idx, src->bind_hdr_occ, NULL, &vptr, &vlen)) {
-					((struct sockaddr_in *)&srv_conn->addr.from)->sin_addr.s_addr =
-						htonl(inetaddr_host_lim(vptr, vptr + vlen));
-				}
-				c_adv(&s->req, rewind);
-			}
-			else {
-				if (http_get_htx_hdr(htxbuf(&s->req.buf),
-						     ist2(src->bind_hdr_name, src->bind_hdr_len),
-						     src->bind_hdr_occ, NULL, &vptr, &vlen)) {
-					((struct sockaddr_in *)&srv_conn->addr.from)->sin_addr.s_addr =
-						htonl(inetaddr_host_lim(vptr, vptr + vlen));
-				}
+			((struct sockaddr_in *)srv_conn->src)->sin_family = AF_INET;
+			((struct sockaddr_in *)srv_conn->src)->sin_port = 0;
+			((struct sockaddr_in *)srv_conn->src)->sin_addr.s_addr = 0;
+			if (http_get_htx_hdr(htxbuf(&s->req.buf),
+					     ist2(src->bind_hdr_name, src->bind_hdr_len),
+					     src->bind_hdr_occ, NULL, &vptr, &vlen)) {
+				((struct sockaddr_in *)srv_conn->src)->sin_addr.s_addr =
+					htonl(inetaddr_host_lim(vptr, vptr + vlen));
 			}
 		}
 		break;
 	default:
-		memset(&srv_conn->addr.from, 0, sizeof(srv_conn->addr.from));
+		sockaddr_free(&srv_conn->src);
 	}
 #endif
 }
@@ -1207,10 +1141,11 @@ fail:
  */
 int connect_server(struct stream *s)
 {
-	struct connection *cli_conn = NULL;
+	struct connection *cli_conn = objt_conn(strm_orig(s));
 	struct connection *srv_conn = NULL;
 	struct connection *old_conn = NULL;
 	struct conn_stream *srv_cs = NULL;
+	struct sess_srv_list *srv_list;
 	struct server *srv;
 	int reuse = 0;
 	int reuse_orphan = 0;
@@ -1219,56 +1154,44 @@ int connect_server(struct stream *s)
 	int err;
 
 
-	/* Some, such as http_proxy and the LUA, create their connection and
-	 * conn_stream manually, so if we already have a conn_stream, try
-	 * to use it.
+	/* This will catch some corner cases such as lying connections resulting from
+	 * retries or connect timeouts but will rarely trigger.
 	 */
-	srv_cs = objt_cs(s->si[1].end);
-	if (!srv_cs)
-		srv_conn = objt_conn(s->si[1].end);
-	else
-		srv_conn = cs_conn(srv_cs);
+	si_release_endpoint(&s->si[1]);
 
-	if (srv_conn) {
-		if (!srv_conn->target || srv_conn->target == s->target) {
-			srv_conn->flags &= ~(CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH);
-			if (srv_cs)
-				srv_cs->flags &= ~(CS_FL_ERROR | CS_FL_EOS | CS_FL_REOS);
-			reuse = 1;
-			old_conn = srv_conn;
-		} else {
-			srv_conn = NULL;
-			si_release_endpoint(&s->si[1]);
-		}
-	}
-
-	if (!old_conn) {
-		struct sess_srv_list *srv_list;
-		list_for_each_entry(srv_list, &s->sess->srv_list, srv_list) {
-			if (srv_list->target == s->target) {
-				list_for_each_entry(srv_conn, &srv_list->conn_list,
-				    session_list) {
-					if (conn_xprt_ready(srv_conn) &&
-					    srv_conn->mux && (srv_conn->mux->avail_streams(srv_conn) > 0)) {
-						reuse = 1;
-						break;
-					}
+	/* first, search for a matching connection in the session's idle conns */
+	list_for_each_entry(srv_list, &s->sess->srv_list, srv_list) {
+		if (srv_list->target == s->target) {
+			list_for_each_entry(srv_conn, &srv_list->conn_list, session_list) {
+				if (conn_xprt_ready(srv_conn) &&
+				    srv_conn->mux && (srv_conn->mux->avail_streams(srv_conn) > 0)) {
+					reuse = 1;
+					break;
 				}
-				break;
 			}
-		}
-		if (reuse == 0) {
-			srv_conn = NULL;
-			if (!LIST_ISEMPTY(&s->sess->srv_list)) {
-				srv_list = LIST_ELEM(s->sess->srv_list.n,
-					struct sess_srv_list *, srv_list);
-				if (!LIST_ISEMPTY(&srv_list->conn_list))
-					srv_conn = LIST_ELEM(srv_list->conn_list.n,
-						struct connection *, session_list);
-			}
-
+			break;
 		}
 	}
+
+	if (!reuse) {
+		/* no connection was found in our session's list. Pick any
+		 * random one that we could trade against another one.
+		 */
+		srv_conn = NULL;
+		if (!LIST_ISEMPTY(&s->sess->srv_list)) {
+			srv_list = LIST_ELEM(s->sess->srv_list.n, struct sess_srv_list *, srv_list);
+			if (!LIST_ISEMPTY(&srv_list->conn_list))
+				srv_conn = LIST_ELEM(srv_list->conn_list.n, struct connection *, session_list);
+		}
+
+	}
+	/* OK at this point we have this :
+	 *   - srv_conn points to an existing connection or NULL
+	 *   - if reuse is set, srv_conn holds a valid connection, otherwise it
+	 *     points to any of our old connections we may want to trade against
+	 *     another one
+	 */
+
 	old_conn = srv_conn;
 
 	srv = objt_server(s->target);
@@ -1289,6 +1212,9 @@ int connect_server(struct stream *s)
 		 *  ----+-----+-----+    ----+-----+-----+   ----+-----+-----+
 		 *  idle|  -  |  1  |    idle|  -  |  1  |   idle|  2  |  1  |
 		 *  ----+-----+-----+    ----+-----+-----+   ----+-----+-----+
+		 *
+		 * Idle conns are necessarily looked up on the same thread so
+		 * that there is no concurrency issues.
 		 */
 		if (srv->idle_conns && !LIST_ISEMPTY(&srv->idle_conns[tid]) &&
 		    ((s->be->options & PR_O_REUSE_MASK) != PR_O_REUSE_NEVR &&
@@ -1303,13 +1229,14 @@ int connect_server(struct stream *s)
 		else if (srv->idle_conns && !LIST_ISEMPTY(&srv->idle_conns[tid]) &&
 			 (s->be->options & PR_O_REUSE_MASK) == PR_O_REUSE_ALWS) {
 			srv_conn = LIST_ELEM(srv->idle_conns[tid].n, struct connection *, list);
-		} else if (srv->idle_orphan_conns && !LIST_ISEMPTY(&srv->idle_orphan_conns[tid]) &&
+		} else if (srv->idle_orphan_conns && !MT_LIST_ISEMPTY(&srv->idle_orphan_conns[tid]) &&
 		    (((s->be->options & PR_O_REUSE_MASK) == PR_O_REUSE_ALWS) ||
 		    (((s->be->options & PR_O_REUSE_MASK) != PR_O_REUSE_NEVR) &&
 		     s->txn && (s->txn->flags & TX_NOT_FIRST)))) {
-			srv_conn = LIST_ELEM(srv->idle_orphan_conns[tid].n,
-			    struct connection *, list);
-			reuse_orphan = 1;
+			srv_conn = MT_LIST_POP(&srv->idle_orphan_conns[tid],
+			                           struct connection *, list);
+			if (srv_conn)
+				reuse_orphan = 1;
 		}
 
 		/* If we've picked a connection from the pool, we now have to
@@ -1322,6 +1249,10 @@ int connect_server(struct stream *s)
 			reuse = 1;
 	}
 
+
+	/* here reuse might have been set above, indicating srv_conn finally
+	 * is OK.
+	 */
 	if (reuse) {
 		/* Disable connection reuse if a dynamic source is used.
 		 * As long as we don't share connections between servers,
@@ -1337,27 +1268,70 @@ int connect_server(struct stream *s)
 				reuse = 0;
 		}
 	}
+
+	if (((!reuse || (srv_conn && !(srv_conn->flags & CO_FL_CONNECTED)))
+	    && ha_used_fds > global.tune.pool_high_count) && srv && srv->idle_orphan_conns) {
+		struct connection *tokill_conn;
+
+		/* We can't reuse a connection, and e have more FDs than deemd
+		 * acceptable, attempt to kill an idling connection
+		 */
+		/* First, try from our own idle list */
+		tokill_conn = MT_LIST_POP(&srv->idle_orphan_conns[tid],
+		    struct connection *, list);
+		if (tokill_conn)
+			tokill_conn->mux->destroy(tokill_conn->ctx);
+		/* If not, iterate over other thread's idling pool, and try to grab one */
+		else {
+			int i;
+
+			for (i = 0; i < global.nbthread; i++) {
+				if (i == tid)
+					continue;
+
+				// just silence stupid gcc which reports an absurd
+				// out-of-bounds warning for <i> which is always
+				// exactly zero without threads, but it seems to
+				// see it possibly larger.
+				ALREADY_CHECKED(i);
+
+				tokill_conn = MT_LIST_POP(&srv->idle_orphan_conns[i],
+				    struct connection *, list);
+				if (tokill_conn) {
+					/* We got one, put it into the concerned thread's to kill list, and wake it's kill task */
+
+					MT_LIST_ADDQ(&toremove_connections[i],
+					    (struct mt_list *)&tokill_conn->list);
+					task_wakeup(idle_conn_cleanup[i], TASK_WOKEN_OTHER);
+					break;
+				}
+			}
+		}
+
+	}
 	/* If we're really reusing the connection, remove it from the orphan
 	 * list and add it back to the idle list.
 	 */
-	if (reuse && reuse_orphan) {
-		LIST_DEL(&srv_conn->list);
-		srv_conn->idle_time = 0;
-		srv->curr_idle_conns--;
-		LIST_ADDQ(&srv->idle_conns[tid], &srv_conn->list);
-		if (LIST_ISEMPTY(&srv->idle_orphan_conns[tid]))
-			task_unlink_wq(srv->idle_task[tid]);
-	} else if (reuse) {
-		if (srv_conn->flags & CO_FL_SESS_IDLE) {
-			struct session *sess = srv_conn->owner;
+	if (reuse) {
+		if (reuse_orphan) {
+			srv_conn->idle_time = 0;
+			_HA_ATOMIC_SUB(&srv->curr_idle_conns, 1);
+			__ha_barrier_atomic_store();
+			srv->curr_idle_thr[tid]--;
+			LIST_ADDQ(&srv->idle_conns[tid], &srv_conn->list);
+		}
+		else {
+			if (srv_conn->flags & CO_FL_SESS_IDLE) {
+				struct session *sess = srv_conn->owner;
 
-			srv_conn->flags &= ~CO_FL_SESS_IDLE;
-			sess->idle_conns--;
+				srv_conn->flags &= ~CO_FL_SESS_IDLE;
+				sess->idle_conns--;
+			}
 		}
 	}
 
 	/* We're about to use another connection, let the mux know we're
-	 * done with this one
+	 * done with this one.
 	 */
 	if (old_conn != srv_conn && old_conn && reuse && !reuse_orphan) {
 		struct session *sess = srv_conn->owner;
@@ -1370,8 +1344,9 @@ int connect_server(struct stream *s)
 				session_unown_conn(s->sess, old_conn);
 				old_conn->owner = sess;
 				if (!session_add_conn(sess, old_conn, old_conn->target)) {
+					old_conn->flags &= ~CO_FL_SESS_IDLE;
 					old_conn->owner = NULL;
-					old_conn->mux->destroy(old_conn);
+					old_conn->mux->destroy(old_conn->ctx);
 				} else
 					session_check_idle_conn(sess, old_conn);
 			}
@@ -1379,10 +1354,7 @@ int connect_server(struct stream *s)
 	}
 
 	if (reuse) {
-		/* We already created a cs earlier when using http_proxy, so
-		 * only create a new one if we don't have one already.
-		 */
-		if (!srv_cs && srv_conn->mux) {
+		if (srv_conn->mux) {
 			int avail = srv_conn->mux->avail_streams(srv_conn);
 
 			if (avail <= 1) {
@@ -1427,28 +1399,34 @@ int connect_server(struct stream *s)
 			srv_conn->owner = NULL;
 			if (srv_conn->mux && !srv_add_to_idle_list(objt_server(srv_conn->target), srv_conn))
 			/* The server doesn't want it, let's kill the connection right away */
-				srv_conn->mux->destroy(srv_conn);
+				srv_conn->mux->destroy(srv_conn->ctx);
 			srv_conn = NULL;
 
 		}
 	}
 
-	if (!srv_conn)
+	if (!srv_conn || !sockaddr_alloc(&srv_conn->dst))
 		return SF_ERR_RESOURCE;
 
 	if (!(s->flags & SF_ADDR_SET)) {
-		err = assign_server_address(s, srv_conn);
+		err = assign_server_address(s);
 		if (err != SRV_STATUS_OK)
 			return SF_ERR_INTERNAL;
 	}
 
+	/* copy the target address into the connection */
+	*srv_conn->dst = *s->target_addr;
+
+	/* Copy network namespace from client connection */
+	srv_conn->proxy_netns = cli_conn ? cli_conn->proxy_netns : NULL;
+
 	if (!conn_xprt_ready(srv_conn) && !srv_conn->mux) {
 		/* set the correct protocol on the output stream interface */
 		if (srv)
-			conn_prepare(srv_conn, protocol_by_family(srv_conn->addr.to.ss_family), srv->xprt);
+			conn_prepare(srv_conn, protocol_by_family(srv_conn->dst->ss_family), srv->xprt);
 		else if (obj_type(s->target) == OBJ_TYPE_PROXY) {
 			/* proxies exclusively run on raw_sock right now */
-			conn_prepare(srv_conn, protocol_by_family(srv_conn->addr.to.ss_family), xprt_get(XPRT_RAW));
+			conn_prepare(srv_conn, protocol_by_family(srv_conn->dst->ss_family), xprt_get(XPRT_RAW));
 			if (!(srv_conn->ctrl))
 				return SF_ERR_INTERNAL;
 		}
@@ -1458,7 +1436,7 @@ int connect_server(struct stream *s)
 #if defined(USE_OPENSSL) && defined(TLSEXT_TYPE_application_layer_protocol_negotiation)
 		if (!srv ||
 		    ((!(srv->ssl_ctx.alpn_str) && !(srv->ssl_ctx.npn_str)) ||
-		    srv->mux_proto))
+		    srv->mux_proto || s->be->mode != PR_MODE_HTTP))
 #endif
 		{
 			srv_cs = objt_cs(s->si[1].end);
@@ -1484,27 +1462,35 @@ int connect_server(struct stream *s)
 		}
 
 #endif
-
-
 		/* process the case where the server requires the PROXY protocol to be sent */
 		srv_conn->send_proxy_ofs = 0;
-		cli_conn = objt_conn(strm_orig(s));
 
 		if (srv && srv->pp_opts) {
 			srv_conn->flags |= CO_FL_PRIVATE;
+			srv_conn->flags |= CO_FL_SEND_PROXY;
 			srv_conn->send_proxy_ofs = 1; /* must compute size */
 			if (cli_conn)
-				conn_get_to_addr(cli_conn);
+				conn_get_dst(cli_conn);
 		}
 
 		assign_tproxy_address(s);
+
+		if (srv && (srv->flags & SRV_F_SOCKS4_PROXY)) {
+			srv_conn->send_proxy_ofs = 1;
+			srv_conn->flags |= CO_FL_SOCKS4;
+		}
 	}
 	else if (!conn_xprt_ready(srv_conn)) {
 		if (srv_conn->mux->reset)
 			srv_conn->mux->reset(srv_conn);
 	}
-	else
-		s->flags |= SF_SRV_REUSED;
+	else {
+		/* Only consider we're doing reuse if the connection was
+		 * ready.
+		 */
+		if (srv_conn->mux->ctl(srv_conn, MUX_STATUS, NULL) & MUX_STATUS_READY)
+			s->flags |= SF_SRV_REUSED;
+	}
 
 	/* flag for logging source ip/port */
 	if (strm_fe(s)->options2 & PR_O2_SRC_ADDR)
@@ -1515,16 +1501,19 @@ int connect_server(struct stream *s)
 		s->si[1].flags |= SI_FL_NOLINGER;
 
 	if (s->flags & SF_SRV_REUSED) {
-		HA_ATOMIC_ADD(&s->be->be_counters.reuse, 1);
+		_HA_ATOMIC_ADD(&s->be->be_counters.reuse, 1);
 		if (srv)
-			HA_ATOMIC_ADD(&srv->counters.reuse, 1);
+			_HA_ATOMIC_ADD(&srv->counters.reuse, 1);
 	} else {
-		HA_ATOMIC_ADD(&s->be->be_counters.connect, 1);
+		_HA_ATOMIC_ADD(&s->be->be_counters.connect, 1);
 		if (srv)
-			HA_ATOMIC_ADD(&srv->counters.connect, 1);
+			_HA_ATOMIC_ADD(&srv->counters.connect, 1);
 	}
 
 	err = si_connect(&s->si[1], srv_conn);
+	if (err != SF_ERR_NONE)
+		return err;
+
 	/* We have to defer the mux initialization until after si_connect()
 	 * has been called, as we need the xprt to have been properly
 	 * initialized, or any attempt to recv during the mux init may
@@ -1543,21 +1532,33 @@ int connect_server(struct stream *s)
 		    srv_conn->mux->avail_streams(srv_conn) > 0)
 			LIST_ADD(&srv->idle_conns[tid], &srv_conn->list);
 	}
-
-
-#ifdef USE_OPENSSL
-	if (!reuse && cli_conn && srv &&
-	    (srv->ssl_ctx.options & SRV_SSL_O_EARLY_DATA) &&
-		    (cli_conn->flags & CO_FL_EARLY_DATA) &&
-		    !channel_is_empty(si_oc(&s->si[1])) &&
-		    srv_conn->flags & CO_FL_SSL_WAIT_HS) {
-		srv_conn->flags &= ~(CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN);
-		srv_conn->flags |= CO_FL_EARLY_SSL_HS;
+	/* The CO_FL_SEND_PROXY flag may have been set by the connect method,
+	 * if so, add our handshake pseudo-XPRT now.
+	 */
+	if ((srv_conn->flags & CO_FL_HANDSHAKE_NOSSL)) {
+		if (xprt_add_hs(srv_conn) < 0) {
+			conn_full_close(srv_conn);
+			return SF_ERR_INTERNAL;
+		}
 	}
-#endif
 
-	if (err != SF_ERR_NONE)
-		return err;
+
+#if USE_OPENSSL && (defined(OPENSSL_IS_BORINGSSL) || (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L))
+
+	if (!reuse && cli_conn && srv && srv_conn->mux &&
+	    (srv->ssl_ctx.options & SRV_SSL_O_EARLY_DATA) &&
+	    /* Only attempt to use early data if either the client sent
+	     * early data, so that we know it can handle a 425, or if
+	     * we are allwoed to retry requests on early data failure, and
+	     * it's our first try
+	     */
+	    ((cli_conn->flags & CO_FL_EARLY_DATA) ||
+	     ((s->be->retry_type & PR_RE_EARLY_ERROR) &&
+	      s->si[1].conn_retries == s->be->conn_retries)) &&
+	    !channel_is_empty(si_oc(&s->si[1])) &&
+	    srv_conn->flags & CO_FL_SSL_WAIT_HS)
+		srv_conn->flags &= ~(CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN);
+#endif
 
 	/* set connect timeout */
 	s->si[1].exp = tick_add_ifset(now_ms, s->be->timeout.connect);
@@ -1566,7 +1567,7 @@ int connect_server(struct stream *s)
 		int count;
 
 		s->flags |= SF_CURR_SESS;
-		count = HA_ATOMIC_ADD(&srv->cur_sess, 1);
+		count = _HA_ATOMIC_ADD(&srv->cur_sess, 1);
 		HA_ATOMIC_UPDATE_MAX(&srv->counters.cur_sess_max, count);
 		if (s->be->lbprm.server_take_conn)
 			s->be->lbprm.server_take_conn(srv);
@@ -1574,35 +1575,9 @@ int connect_server(struct stream *s)
 #ifdef USE_OPENSSL
 		if (srv->ssl_ctx.sni) {
 			struct sample *smp;
-			int rewind;
 
-			if (!IS_HTX_STRM(s)) {
-				/* Tricky case : we have already scheduled the pending
-				 * HTTP request or TCP data for leaving. So in HTTP we
-				 * rewind exactly the headers, otherwise we rewind the
-				 * output data.
-				 */
-				rewind = s->txn ? http_hdr_rewind(&s->txn->req) : co_data(&s->req);
-				c_rew(&s->req, rewind);
-
-				smp = sample_fetch_as_type(s->be, s->sess, s, SMP_OPT_DIR_REQ | SMP_OPT_FINAL,
-							   srv->ssl_ctx.sni, SMP_T_STR);
-
-				/* restore the pointers */
-				c_adv(&s->req, rewind);
-			}
-			else {
-				/* rewind the output data. */
-				rewind = co_data(&s->req);
-				c_rew(&s->req, rewind);
-
-				smp = sample_fetch_as_type(s->be, s->sess, s, SMP_OPT_DIR_REQ | SMP_OPT_FINAL,
-							   srv->ssl_ctx.sni, SMP_T_STR);
-
-				/* restore the pointers */
-				c_adv(&s->req, rewind);
-			}
-
+			smp = sample_fetch_as_type(s->be, s->sess, s, SMP_OPT_DIR_REQ | SMP_OPT_FINAL,
+						   srv->ssl_ctx.sni, SMP_T_STR);
 			if (smp_make_safe(smp)) {
 				ssl_sock_set_servername(srv_conn,
 							smp->data.u.str.area);
@@ -1652,6 +1627,7 @@ int srv_redispatch_connect(struct stream *s)
 		if (((s->flags & (SF_DIRECT|SF_FORCE_PRST)) == SF_DIRECT) &&
 		    (s->be->options & PR_O_REDISP)) {
 			s->flags &= ~(SF_DIRECT | SF_ASSIGNED | SF_ADDR_SET);
+			sockaddr_free(&s->target_addr);
 			goto redispatch;
 		}
 
@@ -1659,8 +1635,8 @@ int srv_redispatch_connect(struct stream *s)
 			s->si[1].err_type = SI_ET_QUEUE_ERR;
 		}
 
-		HA_ATOMIC_ADD(&srv->counters.failed_conns, 1);
-		HA_ATOMIC_ADD(&s->be->be_counters.failed_conns, 1);
+		_HA_ATOMIC_ADD(&srv->counters.failed_conns, 1);
+		_HA_ATOMIC_ADD(&s->be->be_counters.failed_conns, 1);
 		return 1;
 
 	case SRV_STATUS_NOSRV:
@@ -1669,7 +1645,7 @@ int srv_redispatch_connect(struct stream *s)
 			s->si[1].err_type = SI_ET_CONN_ERR;
 		}
 
-		HA_ATOMIC_ADD(&s->be->be_counters.failed_conns, 1);
+		_HA_ATOMIC_ADD(&s->be->be_counters.failed_conns, 1);
 		return 1;
 
 	case SRV_STATUS_QUEUED:
@@ -1689,8 +1665,8 @@ int srv_redispatch_connect(struct stream *s)
 		if (srv)
 			srv_set_sess_last(srv);
 		if (srv)
-			HA_ATOMIC_ADD(&srv->counters.failed_conns, 1);
-		HA_ATOMIC_ADD(&s->be->be_counters.failed_conns, 1);
+			_HA_ATOMIC_ADD(&srv->counters.failed_conns, 1);
+		_HA_ATOMIC_ADD(&s->be->be_counters.failed_conns, 1);
 
 		/* release other streams waiting for this server */
 		if (may_dequeue_tasks(srv, s->be))
@@ -1709,7 +1685,7 @@ int srv_redispatch_connect(struct stream *s)
 void set_backend_down(struct proxy *be)
 {
 	be->last_change = now.tv_sec;
-	HA_ATOMIC_ADD(&be->down_trans, 1);
+	_HA_ATOMIC_ADD(&be->down_trans, 1);
 
 	if (!(global.mode & MODE_STARTING)) {
 		ha_alert("%s '%s' has no server available!\n", proxy_type_str(be), be->id);
@@ -1733,14 +1709,7 @@ int tcp_persist_rdp_cookie(struct stream *s, struct channel *req, int an_bit)
 	uint32_t addr;
 	char *p;
 
-	DPRINTF(stderr,"[%u] %s: stream=%p b=%p, exp(r,w)=%u,%u bf=%08x bh=%lu analysers=%02x\n",
-		now_ms, __FUNCTION__,
-		s,
-		req,
-		req->rex, req->wex,
-		req->flags,
-		ci_data(req),
-		req->analysers);
+	DBG_TRACE_ENTER(STRM_EV_STRM_ANA|STRM_EV_TCP_ANA, s);
 
 	if (s->flags & SF_ASSIGNED)
 		goto no_cookie;
@@ -1783,6 +1752,7 @@ int tcp_persist_rdp_cookie(struct stream *s, struct channel *req, int an_bit)
 no_cookie:
 	req->analysers &= ~an_bit;
 	req->analyse_exp = TICK_ETERNITY;
+	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_TCP_ANA, s);
 	return 1;
 }
 
@@ -2126,6 +2096,26 @@ smp_fetch_srv_id(const struct arg *args, struct sample *smp, const char *kw, voi
 	return 1;
 }
 
+/* set string to the name of the server */
+static int
+smp_fetch_srv_name(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	if (!smp->strm)
+		return 0;
+
+	if (!objt_server(smp->strm->target))
+		return 0;
+
+	smp->data.u.str.area = (char *)__objt_server(smp->strm->target)->id;
+	if (!smp->data.u.str.area)
+	        return 0;
+
+	smp->data.type = SMP_T_STR;
+	smp->data.u.str.data = strlen(smp->data.u.str.area);
+
+	return 1;
+}
+
 /* set temp integer to the number of connections per second reaching the backend.
  * Accepts exactly 1 argument. Argument is a backend, other types will lead to
  * undefined behaviour.
@@ -2317,6 +2307,38 @@ static int sample_conv_nbsrv(const struct arg *args, struct sample *smp, void *p
 	return 1;
 }
 
+static int
+sample_conv_srv_queue(const struct arg *args, struct sample *smp, void *private)
+{
+	struct proxy *px;
+	struct server *srv;
+	char *bksep;
+
+	if (!smp_make_safe(smp))
+		return 0;
+
+	bksep = strchr(smp->data.u.str.area, '/');
+
+	if (bksep) {
+		*bksep = '\0';
+		px = proxy_find_by_name(smp->data.u.str.area, PR_CAP_BE, 0);
+		if (!px)
+			return 0;
+		smp->data.u.str.area = bksep + 1;
+	} else {
+		if (!(smp->px->cap & PR_CAP_BE))
+			return 0;
+		px = smp->px;
+	}
+
+	srv = server_find_by_name(px, smp->data.u.str.area);
+	if (!srv)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = srv->nbpend;
+	return 1;
+}
 
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted.
@@ -2335,6 +2357,7 @@ static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "srv_conn_free", smp_fetch_srv_conn_free,  ARG1(1,SRV), NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "srv_id",        smp_fetch_srv_id,         0,           NULL, SMP_T_SINT, SMP_USE_SERVR, },
 	{ "srv_is_up",     smp_fetch_srv_is_up,      ARG1(1,SRV), NULL, SMP_T_BOOL, SMP_USE_INTRN, },
+	{ "srv_name",      smp_fetch_srv_name,       0,           NULL, SMP_T_STR,  SMP_USE_SERVR, },
 	{ "srv_queue",     smp_fetch_srv_queue,      ARG1(1,SRV), NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "srv_sess_rate", smp_fetch_srv_sess_rate,  ARG1(1,SRV), NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ /* END */ },
@@ -2344,7 +2367,8 @@ INITCALL1(STG_REGISTER, sample_register_fetches, &smp_kws);
 
 /* Note: must not be declared <const> as its list will be overwritten */
 static struct sample_conv_kw_list sample_conv_kws = {ILH, {
-	{ "nbsrv", sample_conv_nbsrv, 0, NULL, SMP_T_STR, SMP_T_SINT },
+	{ "nbsrv",     sample_conv_nbsrv,     0, NULL, SMP_T_STR, SMP_T_SINT },
+	{ "srv_queue", sample_conv_srv_queue, 0, NULL, SMP_T_STR, SMP_T_SINT },
 	{ /* END */ },
 }};
 

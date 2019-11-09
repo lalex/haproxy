@@ -177,6 +177,7 @@ enum h2_err {
 #define H2_MSGF_BODY           0x0001    // a body is present
 #define H2_MSGF_BODY_CL        0x0002    // content-length is present
 #define H2_MSGF_BODY_TUNNEL    0x0004    // a tunnel is in use (CONNECT)
+#define H2_MSGF_RSP_1XX        0x0010    // a 1xx ( != 101) HEADERS frame was received
 
 #define H2_MAX_STREAM_ID       ((1U << 31) - 1)
 #define H2_MAX_FRAME_LEN       ((1U << 24) - 1)
@@ -200,8 +201,6 @@ extern struct h2_frame_definition h2_frame_definition[H2_FT_ENTRIES];
 
 /* various protocol processing functions */
 
-int h2_make_h1_request(struct http_hdr *list, char *out, int osize, unsigned int *msgf, unsigned long long *body_len);
-int h2_make_h1_trailers(struct http_hdr *list, char *out, int osize);
 int h2_parse_cont_len_header(unsigned int *msgf, struct ist *value, unsigned long long *body_len);
 int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *msgf, unsigned long long *body_len);
 int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *msgf, unsigned long long *body_len);

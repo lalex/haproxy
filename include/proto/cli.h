@@ -34,6 +34,8 @@ void cli_register_kw(struct cli_kw_list *kw_list);
 
 int cli_has_level(struct appctx *appctx, int level);
 
+int cli_parse_default(char **args, char *payload, struct appctx *appctx, void *private);
+
 /* mworker proxy functions */
 
 int mworker_cli_proxy_create();
@@ -46,6 +48,52 @@ void mworker_cli_proxy_stop();
 /* analyzers */
 int pcli_wait_for_request(struct stream *s, struct channel *req, int an_bit);
 int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit);
+
+/* updates the CLI's context to log <msg> at <severity> and returns 1. This is
+ * for use in CLI parsers to deal with quick response messages.
+ */
+static inline int cli_msg(struct appctx *appctx, int severity, const char *msg)
+{
+	appctx->ctx.cli.severity = severity;
+	appctx->ctx.cli.msg = msg;
+	appctx->st0 = CLI_ST_PRINT;
+	return 1;
+}
+
+/* updates the CLI's context to log error message <err> and returns 1. The
+ * message will be logged at level LOG_ERR. This is for use in CLI parsers to
+ * deal with quick response messages.
+ */
+static inline int cli_err(struct appctx *appctx, const char *err)
+{
+	appctx->ctx.cli.msg = err;
+	appctx->st0 = CLI_ST_PRINT_ERR;
+	return 1;
+}
+
+/* updates the CLI's context to log <msg> at <severity> and returns 1. The
+ * message must have been dynamically allocated and will be freed. This is
+ * for use in CLI parsers to deal with quick response messages.
+ */
+static inline int cli_dynmsg(struct appctx *appctx, int severity, char *msg)
+{
+	appctx->ctx.cli.severity = severity;
+	appctx->ctx.cli.err = msg;
+	appctx->st0 = CLI_ST_PRINT_DYN;
+	return 1;
+}
+
+/* updates the CLI's context to log error message <err> and returns 1. The
+ * message must have been dynamically allocated and will be freed. The message
+ * will be logged at level LOG_ERR. This is for use in CLI parsers to deal with
+ * quick response messages.
+ */
+static inline int cli_dynerr(struct appctx *appctx, char *err)
+{
+	appctx->ctx.cli.err = err;
+	appctx->st0 = CLI_ST_PRINT_FREE;
+	return 1;
+}
 
 
 #endif /* _PROTO_CLI_H */

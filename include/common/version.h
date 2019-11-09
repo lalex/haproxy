@@ -33,7 +33,7 @@
 #ifdef  CONFIG_PRODUCT_BRANCH
 #define PRODUCT_BRANCH    CONFIG_PRODUCT_BRANCH
 #else
-#define PRODUCT_BRANCH   "2.0"
+#define PRODUCT_BRANCH   "2.1"
 #endif
 
 #ifdef  CONFIG_PRODUCT_URL
@@ -66,9 +66,9 @@
 #error "Must define CONFIG_HAPROXY_DATE"
 #endif
 
-extern const char *haproxy_version;
-extern const char *haproxy_date;
-extern const char *stats_version_string;
+extern char haproxy_version[];
+extern char haproxy_date[];
+extern char stats_version_string[];
 
 #endif /* _COMMON_VERSION_H */
 

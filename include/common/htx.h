@@ -31,101 +31,154 @@
 #include <common/standard.h>
 
 /*
- * The internal representation of an HTTP message is a contiguous array
- * containing both the blocks (htx_blk) and their contents. Blocks are stored
- * starting from the end of the array while their contents are stored at the
- * beginning.
+ * The internal representation of an HTTP message, called HTX, is a structure
+ * with useful information on the message followed by a contiguous array
+ * containing parts of the message, called blocks. A block is composed of
+ * metadata (htx_blk) and the associated payload. Blocks' metadata are stored
+ * starting from the end of the array while their payload are stored at the
+ * beginning. Blocks' metadata are often simply called blocks. it is a misuse of
+ * language that's simplify explainations.
  *
- * As data are sent to the peer, blocks and contents are released at the
- * edges. This free space is reused when no more space left. So blocks and
- * contents may wrap, not necessarily the same time.
  *
- * An HTTP block is as well a header as a body part or a trailer part. For all
- * these types of block, a content is attached to the block. It can also be a
- * mark, like the end-of-headers or end-of-message. For these blocks, there is
- * no content but it count for a byte. It is important to not skip it when data
- * are forwarded. An HTTP block is composed of 2 fields:
+ *  +-----+---------------+------------------------------+--------------+
+ *  | HTX |  PAYLOADS ==> |                              | <== HTX_BLKs |
+ *  +-----+---------------+------------------------------+--------------+
+ *        ^
+ *        blocks[] (the beginning of the bocks array)
+ *
+ *
+ * The blocks part remains linear and sorted. You may think about it as an array
+ * with negative indexes. But, instead of using negative indexes, we use
+ * positive positions to identify a block. This position is then converted to a
+ * address relatively to the beginning of the blocks array.
+ *
+ *
+ *      .....--+------------------------------+-----+-----+
+ *             |                       ...    | BLK | BLK |
+ *      .....--+------------------------------+-----+-----+
+ *                                            ^     ^
+ *                            Addr of the block     Addr of the block
+ *                            at the position 1     at the position 0
+ *
+ *
+ * The payloads part is a raw space that may wrap. You never access to a block's
+ * payload directly. Instead you get a block to retrieve the address of its
+ * payload. When no more space left between blocks and payloads parts, the free
+ * space at the beginning, if any, is used.
+ *
+ *
+ *        +----------- WRAPPING ------------------------+
+ *        |                                             |
+ *        V                                             |
+ *  +-----+-------------+---------------+---------------++--------------+
+ *  | HTX | PAYLOAD ==> |               |  PAYLOADS ==X || X== HTX_BLKs |
+ *  +-----+-------------+---------------+---------------++--------------+
+ *
+ *
+ * The blocks part, on its side, never wrap. If we have no space to allocate a
+ * new block and if there is a hole at the beginning of the blocks part (so at
+ * the end of the blocks array), we move back all blocks.x
+ *
+ *
+ *    ...+--------------+----------+   blocks  ...+----------+--------------+
+ *       | X== HTX_BLKS |          |   defrag     |          | <== HTX_BLKS |
+ *    ...+--------------+----------+   =====>  ...+----------+--------------+
+ *
+ *
+ * At the end, if payload wrapping or blocks defragmenation is not enough, some
+ * free space may be get back with a full defragmenation. This way, the holes in
+ * the middle are not reusable but count in the available free space. The only
+ * way to reuse this lost space is to fully defragmenate the HTX message.
+ *
+ *                                   - * -
+ *
+ * An HTX block is as well a header as a body part or a trailer. For all these
+ * types of block, a payload is attached to the block. It can also be a mark,
+ * like the end-of-headers or end-of-message. For these blocks, there is no
+ * payload but it count for a byte. It is important to not skip it when data are
+ * forwarded. Metadata of an HTX block are composed of 2 fields :
  *
  *     - .info : It a 32 bits field containing the block's type on 4 bits
- *               followed by content' length. See below for details.
+ *               followed by the payload length. See below for details.
  *
- *     - .addr : The content's address, if any, relatively to the beginning the
- *               array used to store the HTTP message itself.
+ *     - .addr : The payload's address, if any, relatively to the beginning the
+ *               array used to store the HTX message itself.
  *
- * htx_blk.info representation:
+ * htx_blk.info representation :
  *
  *   0b 0000 0000 0000 0000 0000 0000 0000 0000
  *      ---- ------------------------ ---------
- *      type     value (1 MB max)     name length (header)
+ *      type     value (1 MB max)     name length (header/trailer)
  *           ----------------------------------
  *                data length (256 MB max)
- *    (body, method, path, version, status, reason, trailers)
+ *    (body, method, path, version, status, reason)
  *
- *   types:
+ *   types :
  *     - 0000 = request  start-line
  *     - 0001 = response start-line
  *     - 0010 = header
  *     - 0011 = pseudo-header ou "special" header
  *     - 0100 = end-of-headers
  *     - 0101 = data
- *     - 0110 = end-of-data
- *     - 0111 = trailer
+ *     - 0110 = trailer
+ *     - 0111 = end-of-trailers
  *     - 1000 = end-of-message
  *       ...
- *     - 1101 = out-of-band
- *     - 1110 = error
  *     - 1111 = unused
  *
  */
 
-/*HTX start-line flags */
-#define HTX_SL_F_NONE          0x00000000
-#define HTX_SL_F_IS_RESP       0x00000001 /* It is the response start-line (unset means the request one) */
-#define HTX_SL_F_XFER_LEN      0x00000002 /* The message xfer size can be dertermined */
-#define HTX_SL_F_XFER_ENC      0x00000004 /* The transfer-encoding header was found in message */
-#define HTX_SL_F_CLEN          0x00000008 /* The content-length header was found in message */
-#define HTX_SL_F_CHNK          0x00000010 /* The message payload is chunked */
-#define HTX_SL_F_VER_11        0x00000020 /* The message indicates version 1.1 or above */
-#define HTX_SL_F_BODYLESS      0x00000040 /* The message has no body (content-length = 0) */
+/* HTX start-line flags */
+#define HTX_SL_F_NONE           0x00000000
+#define HTX_SL_F_IS_RESP        0x00000001 /* It is the response start-line (unset means the request one) */
+#define HTX_SL_F_XFER_LEN       0x00000002 /* The message xfer size can be dertermined */
+#define HTX_SL_F_XFER_ENC       0x00000004 /* The transfer-encoding header was found in message */
+#define HTX_SL_F_CLEN           0x00000008 /* The content-length header was found in message */
+#define HTX_SL_F_CHNK           0x00000010 /* The message payload is chunked */
+#define HTX_SL_F_VER_11         0x00000020 /* The message indicates version 1.1 or above */
+#define HTX_SL_F_BODYLESS       0x00000040 /* The message has no body (content-length = 0) */
+#define HTX_SL_F_HAS_SCHM       0x00000080 /* The scheme is explicitly specified */
+#define HTX_SL_F_SCHM_HTTP      0x00000100 /* The scheme HTTP should be used */
+#define HTX_SL_F_SCHM_HTTPS     0x00000200 /* The scheme HTTPS should be used */
+#define HTX_SL_F_HAS_AUTHORITY  0x00000400 /* The request authority is explicitly specified */
+#define HTX_SL_F_NORMALIZED_URI 0x00000800 /* The received URI is normalized (an implicit absolute-uri form) */
+
 
 /* HTX flags */
 #define HTX_FL_NONE              0x00000000
-#define HTX_FL_PARSING_ERROR     0x00000001
+#define HTX_FL_PARSING_ERROR     0x00000001 /* Set when a parsing error occurred */
+#define HTX_FL_PROCESSING_ERROR  0x00000002 /* Set when a processing error occurred */
+#define HTX_FL_UPGRADE           0x00000004 /* Set when an upgrade is in progress */
+#define HTX_FL_PROXY_RESP        0x00000008 /* Set when the response was generated by HAProxy */
 
 
-/* Pseudo header types (max 255). */
-enum htx_phdr_type {
-	HTX_PHDR_UNKNOWN =  0,
-	HTX_PHDR_SIZE,
-};
-
-/* HTTP block's type (max 15). */
+/* HTX block's type (max 15). */
 enum htx_blk_type {
 	HTX_BLK_REQ_SL =  0, /* Request start-line */
 	HTX_BLK_RES_SL =  1, /* Response start-line */
 	HTX_BLK_HDR    =  2, /* header name/value block */
-	HTX_BLK_PHDR   =  3, /* pseudo header block */
-	HTX_BLK_EOH    =  4, /* end-of-headers block */
-	HTX_BLK_DATA   =  5, /* data block */
-	HTX_BLK_EOD    =  6, /* end-of-data block */
-	HTX_BLK_TLR    =  7, /* trailer name/value block */
-	HTX_BLK_EOM    =  8, /* end-of-message block */
-	/* 9 .. 13 unused */
-	HTX_BLK_OOB    = 14, /* Out of band block, don't alter the parser */
+	HTX_BLK_EOH    =  3, /* end-of-headers block */
+	HTX_BLK_DATA   =  4, /* data block */
+	HTX_BLK_TLR    =  5, /* trailer name/value block */
+	HTX_BLK_EOT    =  6, /* end-of-trailers block */
+	HTX_BLK_EOM    =  7, /* end-of-message block */
+	/* 8 .. 14 unused */
 	HTX_BLK_UNUSED = 15, /* unused/removed block */
 };
 
-/* One HTTP block descriptor */
+/* One HTX block descriptor */
 struct htx_blk {
-	uint32_t addr; /* relative storage address of a data block */
-	uint32_t info; /* information about data stored */
+	uint32_t addr; /* relative storage address of the block's payload */
+	uint32_t info; /* information about the block (type, length) */
 };
 
+/* Composite return value used by some HTX functions */
 struct htx_ret {
-	int32_t ret;
-	struct htx_blk *blk;
+	int32_t ret;         /* A numerical value */
+	struct htx_blk *blk; /* An HTX block */
 };
 
+/* HTX start-line */
 struct htx_sl {
 	unsigned int flags; /* HTX_SL_F_* */
 	union {
@@ -139,6 +192,10 @@ struct htx_sl {
 
 	/* XXX 2 bytes unused */
 
+	int32_t hdrs_bytes;  /* Bytes held by all headers, as seen by the mux
+			      * during parsing, from this start-line to the
+			      * corresponding EOH. -1 if unknown */
+
 	unsigned int len[3]; /* length of differnt parts of the start-line */
 	char         l[0];
 };
@@ -150,18 +207,21 @@ struct htx {
 			  * blocks (blocks and their contents), you need to add size used by blocks,
 			  * i.e. [ used * sizeof(struct htx_blk *) ] */
 
-	uint32_t used;   /* number of blocks in use */
-	uint32_t tail;   /* last inserted block */
-	uint32_t front;  /* block's position of the first content before the blocks table */
-	uint32_t wrap;   /* the position were the blocks table wraps, if any */
+	int32_t tail;   /* newest inserted block. -1 if the HTX message is empty */
+	int32_t head;   /* oldest inserted block. -1 if the HTX message is empty */
+	int32_t first;  /* position of the first block to (re)start the analyse. -1 if unset. */
+
+	uint32_t tail_addr; /* start address of the free space in front of the the blocks table */
+	uint32_t head_addr; /* start address of the free space at the beginning */
+	uint32_t end_addr;  /* end address of the free space at the beginning */
 
 	uint64_t extra;  /* known bytes amount remaining to receive */
 	uint32_t flags;  /* HTX_FL_* */
 
-	int32_t sl_off; /* Offset of the start-line of the HTTP message relatively to the beginning the
-			   data block. -1 if unset */
+	/* XXX 4 bytes unused */
 
-	struct htx_blk blocks[0]; /* Blocks representing the HTTP message itself */
+	/* Blocks representing the HTTP message itself */
+	char blocks[0] __attribute__((aligned(8)));
 };
 
 
@@ -171,6 +231,7 @@ struct htx_blk *htx_defrag(struct htx *htx, struct htx_blk *blk);
 struct htx_blk *htx_add_blk(struct htx *htx, enum htx_blk_type type, uint32_t blksz);
 struct htx_blk *htx_remove_blk(struct htx *htx, struct htx_blk *blk);
 void htx_truncate(struct htx *htx, uint32_t offset);
+struct htx_ret htx_drain(struct htx *htx, uint32_t max);
 
 struct htx_blk *htx_replace_blk_value(struct htx *htx, struct htx_blk *blk,
 				      const struct ist old, const struct ist new);
@@ -186,23 +247,17 @@ struct htx_blk *htx_replace_header(struct htx *htx, struct htx_blk *blk,
 				   const struct ist name, const struct ist value);
 
 struct htx_blk *htx_add_header(struct htx *htx, const struct ist name, const struct ist value);
-struct htx_blk *htx_add_blk_type_size(struct htx *htx, enum htx_blk_type type, uint32_t blksz);
+struct htx_blk *htx_add_trailer(struct htx *htx, const struct ist name, const struct ist value);
 struct htx_blk *htx_add_all_headers(struct htx *htx, const struct http_hdr *hdrs);
-struct htx_blk *htx_add_pseudo_header(struct htx *htx,  enum htx_phdr_type phdr, const struct ist value);
+struct htx_blk *htx_add_all_trailers(struct htx *htx, const struct http_hdr *hdrs);
 struct htx_blk *htx_add_endof(struct htx *htx, enum htx_blk_type type);
-struct htx_blk *htx_add_data(struct htx *htx, const struct ist data);
-struct htx_blk *htx_add_trailer(struct htx *htx, const struct ist tlr);
-struct htx_blk *htx_add_oob(struct htx *htx, const struct ist oob);
-struct htx_blk *htx_add_data_before(struct htx *htx, const struct htx_blk *ref, const struct ist data);
-
-int htx_reqline_to_h1(const struct htx_sl *sl, struct buffer *chk);
-int htx_stline_to_h1(const struct htx_sl *sl, struct buffer *chk);
-int htx_hdr_to_h1(const struct ist n, const struct ist v, struct buffer *chk);
-int htx_data_to_h1(const struct ist data, struct buffer *chk, int chunked);
-int htx_trailer_to_h1(const struct ist tlr, struct buffer *chk);
+struct htx_blk *htx_add_data_atonce(struct htx *htx, struct ist data);
+size_t htx_add_data(struct htx *htx, const struct ist data);
+struct htx_blk *htx_add_last_data(struct htx *htx, struct ist data);
+void htx_move_blk_before(struct htx *htx, struct htx_blk **blk, struct htx_blk **ref);
 
 /* Functions and macros to get parts of the start-line or legnth of these
- * parts
+ * parts. Request and response start-lines are both composed of 3 parts.
  */
 #define HTX_SL_LEN(sl) ((sl)->len[0] + (sl)->len[1] + (sl)->len[2])
 
@@ -227,104 +282,76 @@ int htx_trailer_to_h1(const struct ist tlr, struct buffer *chk);
 #define HTX_SL_RES_CPTR(sl) HTX_SL_P2_PTR(sl)
 #define HTX_SL_RES_RPTR(sl) HTX_SL_P3_PTR(sl)
 
-static inline const struct ist htx_sl_p1(const struct htx_sl *sl)
+static inline struct ist htx_sl_p1(const struct htx_sl *sl)
 {
 	return ist2(HTX_SL_P1_PTR(sl), HTX_SL_P1_LEN(sl));
 }
 
-static inline const struct ist htx_sl_p2(const struct htx_sl *sl)
+static inline struct ist htx_sl_p2(const struct htx_sl *sl)
 {
 	return ist2(HTX_SL_P2_PTR(sl), HTX_SL_P2_LEN(sl));
 }
 
-static inline const struct ist htx_sl_p3(const struct htx_sl *sl)
+static inline struct ist htx_sl_p3(const struct htx_sl *sl)
 {
 	return ist2(HTX_SL_P3_PTR(sl), HTX_SL_P3_LEN(sl));
 }
 
-static inline const struct ist htx_sl_req_meth(const struct htx_sl *sl)
+static inline struct ist htx_sl_req_meth(const struct htx_sl *sl)
 {
 	return htx_sl_p1(sl);
 }
 
-static inline const struct ist htx_sl_req_uri(const struct htx_sl *sl)
+static inline struct ist htx_sl_req_uri(const struct htx_sl *sl)
 {
 	return htx_sl_p2(sl);
 }
 
-static inline const struct ist htx_sl_req_vsn(const struct htx_sl *sl)
+static inline struct ist htx_sl_req_vsn(const struct htx_sl *sl)
 {
 	return htx_sl_p3(sl);
 }
 
 
-static inline const struct ist htx_sl_res_vsn(const struct htx_sl *sl)
+static inline struct ist htx_sl_res_vsn(const struct htx_sl *sl)
 {
 	return htx_sl_p1(sl);
 }
 
-static inline const struct ist htx_sl_res_code(const struct htx_sl *sl)
+static inline struct ist htx_sl_res_code(const struct htx_sl *sl)
 {
 	return htx_sl_p2(sl);
 }
 
-static inline const struct ist htx_sl_res_reason(const struct htx_sl *sl)
+static inline struct ist htx_sl_res_reason(const struct htx_sl *sl)
 {
 	return htx_sl_p3(sl);
 }
 
-/* Returns the HTX start-line if set, otherwise it returns NULL. */
-static inline struct htx_sl *htx_get_stline(struct htx *htx)
+/* Converts a position to the corresponding relative address */
+static inline uint32_t htx_pos_to_addr(const struct htx *htx, uint32_t pos)
 {
-	struct htx_sl *sl = NULL;
-
-	if (htx->sl_off != -1)
-		sl = ((void *)htx->blocks + htx->sl_off);
-
-	return sl;
+	return htx->size - (pos + 1) * sizeof(struct htx_blk);
 }
 
-/* Returns the array index of a block given its position <pos> */
-static inline uint32_t htx_pos_to_idx(const struct htx *htx, uint32_t pos)
-{
-	return ((htx->size / sizeof(htx->blocks[0])) - pos - 1);
-}
-
-/* Returns the position of the block <blk> */
+/* Returns the position of the block <blk>. It is the caller responsibility to
+ * be sure <blk> is part of <htx>. */
 static inline uint32_t htx_get_blk_pos(const struct htx *htx, const struct htx_blk *blk)
 {
-	return (htx->blocks + (htx->size / sizeof(htx->blocks[0])) - blk - 1);
+	return ((htx->blocks + htx->size - (char *)blk) / sizeof(struct htx_blk) - 1);
 }
 
-/* Returns the block at the position <pos> */
+/* Returns the block at the position <pos>. It is the caller responsibility to
+ * be sure the block at the position <pos> exists. */
 static inline struct htx_blk *htx_get_blk(const struct htx *htx, uint32_t pos)
 {
-	return ((struct htx_blk *)(htx->blocks) + htx_pos_to_idx(htx, pos));
+	return (struct htx_blk *)(htx->blocks + htx_pos_to_addr(htx, pos));
 }
 
 /* Returns the type of the block <blk> */
 static inline enum htx_blk_type htx_get_blk_type(const struct htx_blk *blk)
 {
 	return (blk->info >> 28);
-}
-
-/* Returns the pseudo-header type of the block <blk>. If it's not a
- * pseudo-header, HTX_PHDR_UNKNOWN is returned.
- */
-static inline enum htx_phdr_type htx_get_blk_phdr(const struct htx_blk *blk)
-{
-	enum htx_blk_type type = htx_get_blk_type(blk);
-	enum htx_phdr_type phdr;
-
-	switch (type) {
-		case HTX_BLK_PHDR:
-			phdr = (blk->info & 0xff);
-			return phdr;
-
-		default:
-			/* Not a pseudo-header */
-			return HTX_PHDR_UNKNOWN;
-	}
 }
 
 /* Returns the size of the block <blk>, depending of its type */
@@ -334,29 +361,21 @@ static inline uint32_t htx_get_blksz(const struct htx_blk *blk)
 
 	switch (type) {
 		case HTX_BLK_HDR:
+		case HTX_BLK_TLR:
 			/*       name.length       +        value.length        */
 			return ((blk->info & 0xff) + ((blk->info >> 8) & 0xfffff));
-		case HTX_BLK_PHDR:
-			/*          value.length          */
-			return ((blk->info >> 8) & 0xfffff);
 		default:
 			/*         value.length      */
 			return (blk->info & 0xfffffff);
 	}
 }
 
-/* Returns the position of the oldest entry (head).
- *
- * An signed 32-bits integer is returned to handle -1 case. Blocks position are
- * store on unsigned 32-bits integer, but it is impossible to have so much
- * blocks to overflow a 32-bits signed integer !
+/* Returns the position of the oldest entry (head). It returns a signed 32-bits
+ * integer, -1 means the HTX message is empty.
  */
 static inline int32_t htx_get_head(const struct htx *htx)
 {
-	if (!htx->used)
-		return -1;
-
-	return (((htx->tail + 1U < htx->used) ? htx->wrap : 0) + htx->tail + 1U - htx->used);
+	return htx->head;
 }
 
 /* Returns the oldest HTX block (head) if the HTX message is not
@@ -379,15 +398,12 @@ static inline enum htx_blk_type htx_get_head_type(const struct htx *htx)
 	return (blk ? htx_get_blk_type(blk) : HTX_BLK_UNUSED);
 }
 
-/* Returns the position of the newest entry (tail).
- *
- * An signed 32-bits integer is returned to handle -1 case. Blocks position are
- * store on unsigned 32-bits integer, but it is impossible to have so much
- * blocks to overflow a 32-bits signed integer !
+/* Returns the position of the newest entry (tail).  It returns a signed 32-bits
+ * integer, -1 means the HTX message is empty.
  */
 static inline int32_t htx_get_tail(const struct htx *htx)
 {
-	return (htx->used ? htx->tail : -1);
+	return htx->tail;
 }
 
 /* Returns the newest HTX block (tail) if the HTX message is not
@@ -410,22 +426,42 @@ static inline enum htx_blk_type htx_get_tail_type(const struct htx *htx)
 	return (blk ? htx_get_blk_type(blk) : HTX_BLK_UNUSED);
 }
 
+/* Returns the position of the first block in the HTX message <htx>. -1 means
+ * the first block is unset or the HTS is empty.
+ */
+static inline int32_t htx_get_first(const struct htx *htx)
+{
+	return htx->first;
+}
+
+/* Returns the first HTX block in the HTX message <htx>. If unset or if <htx> is
+ * empty, NULL returned.
+ */
+static inline struct htx_blk *htx_get_first_blk(const struct htx *htx)
+{
+	int32_t pos;
+
+	pos = htx_get_first(htx);
+	return ((pos == -1) ? NULL : htx_get_blk(htx, pos));
+}
+
+/* Returns the type of the first block in the HTX message <htx>. If unset or if
+ * <htx> is empty, HTX_BLK_UNUSED is returned.
+ */
+static inline enum htx_blk_type htx_get_first_type(const struct htx *htx)
+{
+	struct htx_blk *blk = htx_get_first_blk(htx);
+
+	return (blk ? htx_get_blk_type(blk) : HTX_BLK_UNUSED);
+}
+
 /* Returns the position of block immediately before the one pointed by <pos>. If
  * the message is empty or if <pos> is the position of the head, -1 returned.
- *
- * An signed 32-bits integer is returned to handle -1 case. Blocks position are
- * store on unsigned 32-bits integer, but it is impossible to have so much
- * blocks to overflow a 32-bits signed integer !
  */
 static inline int32_t htx_get_prev(const struct htx *htx, uint32_t pos)
 {
-	int32_t head;
-
-	head = htx_get_head(htx);
-	if (head == -1 || pos == head)
+	if (htx->head == -1 || pos == htx->head)
 		return -1;
-	if (!pos)
-		return (htx->wrap - 1);
 	return (pos - 1);
 }
 
@@ -443,22 +479,12 @@ static inline struct htx_blk *htx_get_prev_blk(const struct htx *htx,
 
 /* Returns the position of block immediately after the one pointed by <pos>. If
  * the message is empty or if <pos> is the position of the tail, -1 returned.
- *
- * An signed 32-bits integer is returned to handle -1 case. Blocks position are
- * store on unsigned 32-bits integer, but it is impossible to have so much
- * blocks to overflow a 32-bits signed integer !
  */
 static inline int32_t htx_get_next(const struct htx *htx, uint32_t pos)
 {
-	if (!htx->used)
+	if (htx->tail == -1 || pos == htx->tail)
 		return -1;
-
-	if (pos == htx->tail)
-		return -1;
-	pos++;
-	if (pos >= htx->wrap)
-		pos = 0;
-	return pos;
+	return (pos + 1);
 
 }
 
@@ -474,50 +500,42 @@ static inline struct htx_blk *htx_get_next_blk(const struct htx *htx,
 	return ((pos == -1) ? NULL : htx_get_blk(htx, pos));
 }
 
-static inline int32_t htx_find_front(const struct htx *htx)
-{
-	int32_t  front, pos;
-	uint32_t addr = 0;
-
-	if (!htx->used)
-		return -1;
-
-	front = -1;
-	for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
-		struct htx_blk   *blk  = htx_get_blk(htx, pos);
-		enum htx_blk_type type = htx_get_blk_type(blk);
-
-		if (type != HTX_BLK_UNUSED && blk->addr >= addr) {
-			front = pos;
-			addr  = blk->addr;
-		}
-	}
-
-	return front;
-}
-
-/* Returns the HTX block containing data with the <offset>, relatively to the
- * beginning of the HTX message <htx>. It returns an htx_ret. if the HTX block is
- * not found, htx_ret.blk is set to NULL. Otherwise, it points to the right HTX
- * block and htx_ret.ret is set to the remaining offset inside the block.
- */
-static inline struct htx_ret htx_find_blk(const struct htx *htx, uint32_t offset)
-{
-	int32_t pos;
-
-	for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
-		struct htx_blk *blk = htx_get_blk(htx, pos);
-		uint32_t sz = htx_get_blksz(blk);
-
-		if (offset < sz)
-			return (struct htx_ret){ .blk = blk, .ret = offset };
-		offset -= sz;
-	}
-
-	return (struct htx_ret){ .blk = NULL };
-}
 /* Changes the size of the value. It is the caller responsibility to change the
- * value itself, make sure there is enough space and update allocated value.
+ * value itself, make sure there is enough space and update allocated
+ * value. This function updates the HTX message accordingly.
+ */
+static inline void htx_change_blk_value_len(struct htx *htx, struct htx_blk *blk, uint32_t newlen)
+{
+	enum htx_blk_type type = htx_get_blk_type(blk);
+	uint32_t oldlen, sz;
+	int32_t delta;
+
+	sz = htx_get_blksz(blk);
+	switch (type) {
+		case HTX_BLK_HDR:
+		case HTX_BLK_TLR:
+			oldlen = (blk->info >> 8) & 0xfffff;
+			blk->info = (type << 28) + (newlen << 8) + (blk->info & 0xff);
+			break;
+		default:
+			oldlen = blk->info & 0xfffffff;
+			blk->info = (type << 28) + newlen;
+			break;
+	}
+
+	/* Update HTTP message */
+	delta = (newlen - oldlen);
+	htx->data += delta;
+	if (blk->addr+sz == htx->tail_addr)
+		htx->tail_addr += delta;
+	else if (blk->addr+sz == htx->head_addr)
+		htx->head_addr += delta;
+}
+
+/* Changes the size of the value. It is the caller responsibility to change the
+ * value itself, make sure there is enough space and update allocated
+ * value. Unlike the function htx_change_blk_value_len(), this one does not
+ * update the HTX message. So it should be used with caution.
  */
 static inline void htx_set_blk_value_len(struct htx_blk *blk, uint32_t vlen)
 {
@@ -525,14 +543,12 @@ static inline void htx_set_blk_value_len(struct htx_blk *blk, uint32_t vlen)
 
 	switch (type) {
 		case HTX_BLK_HDR:
-		case HTX_BLK_PHDR:
+		case HTX_BLK_TLR:
 			blk->info = (type << 28) + (vlen << 8) + (blk->info & 0xff);
 			break;
 		case HTX_BLK_REQ_SL:
 		case HTX_BLK_RES_SL:
 		case HTX_BLK_DATA:
-		case HTX_BLK_TLR:
-		case HTX_BLK_OOB:
 			blk->info = (type << 28) + vlen;
 			break;
 		default:
@@ -547,8 +563,8 @@ static inline void *htx_get_blk_ptr(const struct htx *htx, const struct htx_blk 
 	return ((void *)htx->blocks + blk->addr);
 }
 
-/* Returns the name of the block <blk>, only if it is a header. Otherwise it
- * returns an empty name.
+/* Returns the name of the block <blk>, only if it is a header or a
+ * trailer. Otherwise it returns an empty string.
  */
 static inline struct ist htx_get_blk_name(const struct htx *htx, const struct htx_blk *blk)
 {
@@ -557,6 +573,7 @@ static inline struct ist htx_get_blk_name(const struct htx *htx, const struct ht
 
 	switch (type) {
 		case HTX_BLK_HDR:
+		case HTX_BLK_TLR:
 			ret.ptr = htx_get_blk_ptr(htx, blk);
 			ret.len = blk->info & 0xff;
 			break;
@@ -569,7 +586,7 @@ static inline struct ist htx_get_blk_name(const struct htx *htx, const struct ht
 
 
 /* Returns the value of the block <blk>, depending on its type. If there is no
- * value, an empty one is retruned.
+ * value (for end-of blocks), an empty one is retruned.
  */
 static inline struct ist htx_get_blk_value(const struct htx *htx, const struct htx_blk *blk)
 {
@@ -578,20 +595,14 @@ static inline struct ist htx_get_blk_value(const struct htx *htx, const struct h
 
 	switch (type) {
 		case HTX_BLK_HDR:
+		case HTX_BLK_TLR:
 			ret.ptr = htx_get_blk_ptr(htx, blk) + (blk->info & 0xff);
-			ret.len = (blk->info >> 8) & 0xfffff;
-			break;
-
-		case HTX_BLK_PHDR:
-			ret.ptr = htx_get_blk_ptr(htx, blk);
 			ret.len = (blk->info >> 8) & 0xfffff;
 			break;
 
 		case HTX_BLK_REQ_SL:
 		case HTX_BLK_RES_SL:
 		case HTX_BLK_DATA:
-		case HTX_BLK_TLR:
-		case HTX_BLK_OOB:
 			ret.ptr = htx_get_blk_ptr(htx, blk);
 			ret.len = blk->info & 0xfffffff;
 			break;
@@ -611,6 +622,8 @@ static inline struct ist htx_get_blk_value(const struct htx *htx, const struct h
  */
 static inline void htx_cut_data_blk(struct htx *htx, struct htx_blk *blk, uint32_t n)
 {
+	if (blk->addr == htx->end_addr)
+		htx->end_addr += n;
 	blk->addr += n;
 	blk->info -= n;
 	htx->data -= n;
@@ -619,10 +632,13 @@ static inline void htx_cut_data_blk(struct htx *htx, struct htx_blk *blk, uint32
 /* Returns the space used by metadata in <htx>. */
 static inline uint32_t htx_meta_space(const struct htx *htx)
 {
-	return (htx->used * sizeof(htx->blocks[0]));
+	if (htx->tail == -1)
+		return 0;
+
+	return ((htx->tail + 1 - htx->head) * sizeof(struct htx_blk));
 }
 
-/* Returns the space used (data + metadata) in <htx> */
+/* Returns the space used (payload + metadata) in <htx> */
 static inline uint32_t htx_used_space(const struct htx *htx)
 {
 	return (htx->data + htx_meta_space(htx));
@@ -634,15 +650,6 @@ static inline uint32_t htx_free_space(const struct htx *htx)
 	return (htx->size - htx_used_space(htx));
 }
 
-/* Returns the maximum space usable for data in <htx>. This is in fact the
- * maximum sice for a uniq block to fill the HTX message. */
-static inline uint32_t htx_max_data_space(const struct htx *htx)
-{
-	if (!htx->size)
-		return 0;
-	return (htx->size - sizeof(htx->blocks[0]));
-}
-
 /* Returns the maximum size available to store some data in <htx> if a new block
  * is reserved.
  */
@@ -650,9 +657,23 @@ static inline uint32_t htx_free_data_space(const struct htx *htx)
 {
 	uint32_t free = htx_free_space(htx);
 
-	if (free < sizeof(htx->blocks[0]))
+	if (free < sizeof(struct htx_blk))
 		return 0;
-	return (free - sizeof(htx->blocks[0]));
+	return (free - sizeof(struct htx_blk));
+}
+
+/* Returns the maximum size for a block, not exceeding <max> bytes. <max> may be
+ * set to -1 to have no limit.
+ */
+static inline uint32_t htx_get_max_blksz(const struct htx *htx, int32_t max)
+{
+	uint32_t free = htx_free_space(htx);
+
+	if (max != -1 && free > max)
+		free = max;
+	if (free < sizeof(struct htx_blk))
+		return 0;
+	return (free - sizeof(struct htx_blk));
 }
 
 /* Returns 1 if the message has less than 1/4 of its capacity free, otherwise 0 */
@@ -663,15 +684,17 @@ static inline int htx_almost_full(const struct htx *htx)
 	return 0;
 }
 
+/* Resets an HTX message */
 static inline void htx_reset(struct htx *htx)
 {
-	htx->data = htx->used = htx->tail = htx->wrap  = htx->front = 0;
+	htx->tail = htx->head  = htx->first = -1;
+	htx->data = 0;
+	htx->tail_addr = htx->head_addr = htx->end_addr = 0;
 	htx->extra = 0;
 	htx->flags = HTX_FL_NONE;
-	htx->sl_off = -1;
 }
 
-/* returns the available room for raw data in buffer <buf> once HTX overhead is
+/* Returns the available room for raw data in buffer <buf> once HTX overhead is
  * taken into account (one HTX header and two blocks). The purpose is to figure
  * the optimal fill length to avoid copies.
  */
@@ -690,9 +713,11 @@ static inline size_t buf_room_for_htx_data(const struct buffer *buf)
 
 
 /* Returns an HTX message using the buffer <buf>. Unlike htx_from_buf(), this
- * function does not update to the buffer.
- * Note that it always returns a valid pointer, either to an initialized buffer
- * or to the empty buffer.
+ * function does not update the buffer. So if the HTX message is updated, the
+ * caller must call htx_to_buf() to be sure to also update the underlying buffer
+ * accordingly.  Note that it always returns a valid pointer, either to an
+ * initialized buffer or to the empty buffer. This function must always be
+ * called with a buffer containing an HTX message (or an empty buffer).
  */
 static inline struct htx *htxbuf(const struct buffer *buf)
 {
@@ -709,9 +734,11 @@ static inline struct htx *htxbuf(const struct buffer *buf)
 }
 
 /* Returns an HTX message using the buffer <buf>. <buf> is updated to appear as
- * full. It is the caller responsibility to call htx_to_buf() when it finish to
- * manipulate the HTX message to update <buf> accordingly. The returned pointer
- * is always valid.
+ * full. It should be used when you want to add something into the HTX message,
+ * so the call to htx_to_buf() may be skipped. But, it is the caller
+ * responsibility to call htx_to_buf() to reset <buf> if it is relevant. The
+ * returned pointer is always valid. This function must always be called with a
+ * buffer containing an HTX message (or an empty buffer).
  *
  * The caller can call htxbuf() function to avoid any update of the buffer.
  */
@@ -723,10 +750,11 @@ static inline struct htx *htx_from_buf(struct buffer *buf)
 	return htx;
 }
 
-/* Upate <buf> accordingly to the HTX message <htx> */
+/* Update <buf> accordingly to the HTX message <htx> */
 static inline void htx_to_buf(struct htx *htx, struct buffer *buf)
 {
-	if (!htx->used) {
+	if ((htx->head == -1) &&
+	    !(htx->flags & (HTX_FL_PARSING_ERROR|HTX_FL_PROCESSING_ERROR|HTX_FL_UPGRADE))) {
 		htx_reset(htx);
 		b_set_data(buf, 0);
 	}
@@ -739,7 +767,7 @@ static inline void htx_to_buf(struct htx *htx, struct buffer *buf)
  */
 static inline int htx_is_empty(const struct htx *htx)
 {
-	return !htx->used;
+	return (htx->head == -1);
 }
 
 /* Returns 1 if the message is not empty, otherwise it returns 0. Note that it
@@ -747,9 +775,17 @@ static inline int htx_is_empty(const struct htx *htx)
  */
 static inline int htx_is_not_empty(const struct htx *htx)
 {
-	return htx->used;
+	return (htx->head != -1);
 }
 
+/* Returns the number of used blocks in the HTX message <htx>. Note that it is
+ * illegal to call this function with htx == NULL. Note also blocks of type
+ * HTX_BLK_UNUSED are part of used blocks.
+ */
+static inline int htx_nbblks(const struct htx *htx)
+{
+	return ((htx->head != -1) ? (htx->tail + 1 - htx->head) : 0);
+}
 /* For debugging purpose */
 static inline const char *htx_blk_type_str(enum htx_blk_type type)
 {
@@ -757,42 +793,35 @@ static inline const char *htx_blk_type_str(enum htx_blk_type type)
 		case HTX_BLK_REQ_SL: return "HTX_BLK_REQ_SL";
 		case HTX_BLK_RES_SL: return "HTX_BLK_RES_SL";
 		case HTX_BLK_HDR:    return "HTX_BLK_HDR";
-		case HTX_BLK_PHDR:   return "HTX_BLK_PHDR";
 		case HTX_BLK_EOH:    return "HTX_BLK_EOH";
 		case HTX_BLK_DATA:   return "HTX_BLK_DATA";
-		case HTX_BLK_EOD:    return "HTX_BLK_EOD";
 		case HTX_BLK_TLR:    return "HTX_BLK_TLR";
+		case HTX_BLK_EOT:    return "HTX_BLK_EOT";
 		case HTX_BLK_EOM:    return "HTX_BLK_EOM";
-		case HTX_BLK_OOB:    return "HTX_BLK_OOB";
 		case HTX_BLK_UNUSED: return "HTX_BLK_UNUSED";
 		default:             return "HTX_BLK_???";
 	};
 }
 
-static inline const char *htx_blk_phdr_str(enum htx_phdr_type phdr)
-{
-	switch (phdr) {
-		case HTX_PHDR_UNKNOWN: return "HTX_PHDR_UNKNOWN";
-		default:               return "HTX_PHDR_???";
-	}
-}
-
-static inline void htx_dump(struct htx *htx)
+/* For debugging purpose */
+static inline void htx_dump(struct buffer *chunk, const struct htx *htx, int full)
 {
 	int32_t pos;
 
-	fprintf(stderr, "htx:%p [ size=%u - data=%u - used=%u - wrap=%s - extra=%llu]\n",
-		htx, htx->size, htx->data, htx->used,
-		(!htx->used || htx->tail+1 == htx->wrap) ? "NO" : "YES",
-		(unsigned long long)htx->extra);
-	fprintf(stderr, "\thead=%d - tail=%u - front=%u - wrap=%u\n",
-		htx_get_head(htx), htx->tail, htx->front, htx->wrap);
+	chunk_appendf(chunk, " htx=%p(size=%u,data=%u,used=%u,wrap=%s,flags=0x%08x,extra=%llu,"
+		      "first=%d,head=%d,tail=%d,tail_addr=%d,head_addr=%d,end_addr=%d)",
+		      htx, htx->size, htx->data, htx_nbblks(htx), (!htx->head_addr) ? "NO" : "YES",
+		      htx->flags, (unsigned long long)htx->extra, htx->first, htx->head, htx->tail,
+		      htx->tail_addr, htx->head_addr, htx->end_addr);
+
+	if (!full || !htx_nbblks(htx))
+		return;
+	chunk_memcat(chunk, "\n", 1);
 
 	for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
 		struct htx_sl     *sl;
 		struct htx_blk    *blk  = htx_get_blk(htx, pos);
 		enum htx_blk_type  type = htx_get_blk_type(blk);
-		enum htx_phdr_type phdr = htx_get_blk_phdr(blk);
 		uint32_t           sz   = htx_get_blksz(blk);
 		struct ist         n, v;
 
@@ -801,28 +830,22 @@ static inline void htx_dump(struct htx *htx)
 
 		if (type == HTX_BLK_REQ_SL || type == HTX_BLK_RES_SL) {
 			sl = htx_get_blk_ptr(htx, blk);
-			fprintf(stderr, "\t\t[%u] type=%-17s - size=%-6u - addr=%-6u\t%.*s %.*s %.*s\n",
-				pos, htx_blk_type_str(type), sz, blk->addr,
-				HTX_SL_P1_LEN(sl), HTX_SL_P1_PTR(sl),
-				HTX_SL_P2_LEN(sl), HTX_SL_P2_PTR(sl),
-				HTX_SL_P3_LEN(sl), HTX_SL_P3_PTR(sl));
+			chunk_appendf(chunk, "\t\t[%u] type=%-17s - size=%-6u - addr=%-6u\t%.*s %.*s %.*s\n",
+				      pos, htx_blk_type_str(type), sz, blk->addr,
+				      HTX_SL_P1_LEN(sl), HTX_SL_P1_PTR(sl),
+				      HTX_SL_P2_LEN(sl), HTX_SL_P2_PTR(sl),
+				      HTX_SL_P3_LEN(sl), HTX_SL_P3_PTR(sl));
 		}
-		else if (type == HTX_BLK_HDR)
-			fprintf(stderr, "\t\t[%u] type=%-17s - size=%-6u - addr=%-6u\t%.*s: %.*s\n",
-				pos, htx_blk_type_str(type), sz, blk->addr,
-				(int)n.len, n.ptr,
-				(int)v.len, v.ptr);
-
-		else if (type == HTX_BLK_PHDR)
-			fprintf(stderr, "\t\t[%u] type=%-17s - size=%-6u - addr=%-6u\t%.*s\n",
-				pos, htx_blk_phdr_str(phdr), sz, blk->addr,
-				(int)v.len, v.ptr);
+		else if (type == HTX_BLK_HDR || type == HTX_BLK_TLR)
+			chunk_appendf(chunk, "\t\t[%u] type=%-17s - size=%-6u - addr=%-6u\t%.*s: %.*s\n",
+				      pos, htx_blk_type_str(type), sz, blk->addr,
+				      (int)n.len, n.ptr,
+				      (int)v.len, v.ptr);
 		else
-			fprintf(stderr, "\t\t[%u] type=%-17s - size=%-6u - addr=%-6u%s\n",
-				pos, htx_blk_type_str(type), sz, blk->addr,
-				(!v.len ? "\t<empty>" : ""));
+			chunk_appendf(chunk, "\t\t[%u] type=%-17s - size=%-6u - addr=%-6u%s\n",
+				      pos, htx_blk_type_str(type), sz, blk->addr,
+				      (!v.len ? "\t<empty>" : ""));
 	}
-	fprintf(stderr, "\n");
 }
 
 #endif /* _COMMON_HTX_H */
